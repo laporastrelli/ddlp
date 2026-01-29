@@ -1,0 +1,122 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Environment
+venv/
+ENV/
+env/
+.env
+*.env
+
+# Training runs (timestamp-based directories)
+[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*/
+*_ddlp/
+*_dlp/
+
+# Checkpoints and model saves
+checkpoints/*.pth
+checkpoints/*.pt
+checkpoints/*.ckpt
+saves/
+*.pth
+*.pt
+*.ckpt
+
+# Logs
+*.log
+log.txt
+logs/
+wandb/
+
+# Figures and outputs
+figures/
+outputs/
+results/
+samples/
+
+# Data directories (large datasets should not be in git)
+data/BALLS_INTERACTION/
+data/*/
+!data/.gitkeep
+    
+# zip and tar files
+*.zip
+
+# HDF5 and large data files
+*.hdf5
+*.h5
+*.h5.1
+*.npz
+*.npy
+
+# Videos and images (if generated)
+*.mp4
+*.avi
+*.mov
+*.gif
+*.png
+*.jpg
+*.jpeg
+
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Compiled files
+*.o
+*.a
+*.lib
+*.dll
+*.dylib
+
+# System files
+.cache/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Keep important config and documentation
+!configs/*.json
+!assets/
+!docs/
+!README.md
+!LICENSE
+!requirements.txt
+!environment.yml
+!environment_simplified.yml

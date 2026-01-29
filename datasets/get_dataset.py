@@ -5,7 +5,14 @@ from datasets.shapes_ds import generate_shape_dataset_torch
 from datasets.balls_ds import Balls, BallsImage
 from datasets.obj3d_ds import Obj3D, Obj3DImage
 from datasets.phyre_ds import PhyreDataset, PhyreDatasetImage
-from datasets.langtable_ds import LanguageTableDataset, LanguageTableDatasetImage
+from datasets.two_body_ds import TwoBodyDataset, TwoBodyDatasetImage
+
+# Optional: Language Table dataset (may not be available)
+try:
+    from datasets.langtable_ds import LanguageTableDataset, LanguageTableDatasetImage
+    LANGTABLE_AVAILABLE = True
+except ImportError:
+    LANGTABLE_AVAILABLE = False
 
 
 def get_video_dataset(ds, root, seq_len=1, mode='train', image_size=128):
@@ -23,7 +30,11 @@ def get_video_dataset(ds, root, seq_len=1, mode='train', image_size=128):
         dataset = Obj3D(root=root, mode=mode, sample_length=seq_len, res=image_size)
     elif ds == 'phyre':
         dataset = PhyreDataset(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
+    elif ds == 'twobody':
+        dataset = TwoBodyDataset(root=root, mode=mode, sample_length=seq_len)
     elif ds == 'langtable':
+        if not LANGTABLE_AVAILABLE:
+            raise ImportError("Language Table dataset is not available. Please install or remove from config.")
         dataset = LanguageTableDataset(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
     else:
         raise NotImplementedError
@@ -46,12 +57,16 @@ def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
         dataset = Obj3DImage(root=root, mode=mode, sample_length=seq_len, res=image_size)
     elif ds == 'phyre':
         dataset = PhyreDatasetImage(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
+    elif ds == 'twobody':
+        dataset = TwoBodyDatasetImage(root=root, mode=mode, sample_length=seq_len)
     elif ds == 'shapes':
         if mode == 'train':
             dataset = generate_shape_dataset_torch(img_size=image_size, num_images=40_000)
         else:
             dataset = generate_shape_dataset_torch(img_size=image_size, num_images=2_000)
     elif ds == 'langtable':
+        if not LANGTABLE_AVAILABLE:
+            raise ImportError("Language Table dataset is not available. Please install or remove from config.")
         dataset = LanguageTableDatasetImage(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
     else:
         raise NotImplementedError

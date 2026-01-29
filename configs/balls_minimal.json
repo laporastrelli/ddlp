@@ -1,7 +1,7 @@
 {
   "ds": "balls",
-  "root": "/data2/users/lr4617/ddlp/data/BALLS_INTERACTION",
-  "device": "cuda:1",
+  "root": "/mnt/data/tal/gswm_balls/BALLS_INTERACTION",
+  "device": "cuda",
   "batch_size": 32,
   "lr": 0.0002,
   "kp_activation": "tanh",
@@ -54,7 +54,7 @@
   "pint_layers": 6,
   "pint_heads": 8,
   "pint_dim": 256,
-  "run_prefix": "",
+  "run_prefix": "minimal_",
   "animation_horizon": 100,
   "eval_im_metrics": true,
   "use_resblock": false,
@@ -70,5 +70,11 @@
   "animation_fps": 0.06,
   "use_correlation_heatmaps": true,
   "enable_enc_attn": false,
-  "filtering_heuristic": "variance"
+  "filtering_heuristic": "variance",
+  "_comment_representation": "Minimal: z_p(2D) + z_f(3D) = 5D per particle",
+  "_comment_removed": "z_d (depth), z_t (transparency), and z_s (scale) removed - only position and appearance needed",
+  "use_depth": false,
+  "use_transparency": false,
+  "use_scale": false,
+  "fixed_scale_value": 0.25
 }

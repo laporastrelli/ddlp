@@ -143,10 +143,52 @@ def train_ddlp(config_path='./configs/balls.json'):
 
     if load_model and pretrained_path is not None:
         try:
-            model.load_state_dict(torch.load(pretrained_path, map_location=device))
-            print("loaded model from checkpoint")
-        except:
-            print("model checkpoint not found")
+            checkpoint = torch.load(pretrained_path, map_location=device)
+            # Support both old format (state_dict only) and new format (full checkpoint)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                # NEW FORMAT: Full checkpoint with optimizer and scheduler states
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                checkpoint_epoch = checkpoint.get('epoch', 0)
+                print(f"✓ Loaded complete checkpoint from epoch {checkpoint_epoch}")
+                print(f"  - Model weights: ✓")
+                print(f"  - Optimizer state: ✓")
+                print(f"  - Scheduler state: ✓ (LR will continue from checkpoint)")
+            else:
+                # OLD FORMAT: Only model state_dict (no optimizer/scheduler)
+                model.load_state_dict(checkpoint)
+                print("⚠ Loaded checkpoint (OLD FORMAT)")
+                print(f"  - Model weights: ✓")
+                print(f"  - Optimizer state: ✗ (optimizer will restart)")
+                print(f"  - Scheduler state: ✗ (scheduler will restart)")
+                print(f"  ⚠ WARNING: Learning rate will restart from config value (lr={lr})")
+                
+                # Check if lr looks like an unadjusted default value
+                # Most DDLP configs use 0.0002 as default, or values >= 1e-4
+                if lr >= 1e-4:
+                    print(f"\n{'='*70}")
+                    print(f"ERROR: Cannot resume training from old checkpoint with default lr!")
+                    print(f"{'='*70}")
+                    print(f"Current lr in config: {lr}")
+                    print(f"This appears to be an unadjusted default learning rate.")
+                    print(f"\nWhen resuming from an old checkpoint without scheduler state,")
+                    print(f"you MUST manually adjust the learning rate to account for decay.")
+                    print(f"\nTo fix this:")
+                    print(f"  1. Calculate expected lr after N epochs: lr_new = lr × (scheduler_gamma^N)")
+                    print(f"  2. Update 'lr' in your config file")
+                    print(f"  3. Example: For epoch 50, lr = 0.0002 × (0.95^50) ≈ 1.54e-06")
+                    print(f"\nAlternatively, to use this checkpoint for evaluation only,")
+                    print(f"use a different script (not train_ddlp.py)")
+                    print(f"{'='*70}")
+                    raise ValueError("Learning rate not adjusted for checkpoint resuming. See error message above.")
+                else:
+                    print(f"  ✓ Learning rate appears to be adjusted for resuming (lr={lr})")
+        except ValueError:
+            # Re-raise ValueError to stop execution
+            raise
+        except Exception as e:
+            print(f"✗ Error loading checkpoint: {e}")
 
     # log statistics
     losses = []
@@ -179,6 +221,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     iter_per_step = dynamics_warmup_iters // timestep_horizon
     max_iterations_per_step = [iter_per_step * (i + 1) for i in range(timestep_horizon)]
     iteration = 0  # initialize iterations counter
+    start_epoch = 0  # will be updated if loading from checkpoint
 
     for epoch in range(num_epochs):
         model.train()
@@ -385,17 +428,26 @@ def train_ddlp(config_path='./configs/balls.json'):
                           dim=0).data.cpu(), '{}/image_obj_{}.jpg'.format(fig_dir, epoch),
                 nrow=8, pad_value=1)
 
-            torch.save(model.state_dict(), os.path.join(save_dir, f'{ds}_ddlp{run_prefix}.pth'))
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch
+            }
+            torch.save(checkpoint, os.path.join(save_dir, f'{ds}_ddlp{run_prefix}.pth'))
             animate_trajectory_ddlp(model, config, epoch, device=device, fig_dir=fig_dir,
                                     timestep_horizon=animation_horizon,
                                     num_trajetories=1, train=True, cond_steps=cond_steps)
             print("validation step...")
+            # Validation ELBO uses timestep_horizon (model's max capacity)
+            # Long-range forecasting happens in animate_trajectory_ddlp which uses animation_horizon
             valid_loss = evaluate_validation_elbo_dyn(model, config, epoch, batch_size=batch_size,
                                                       recon_loss_type=recon_loss_type, device=device,
                                                       save_image=True, fig_dir=fig_dir, topk=topk,
                                                       recon_loss_func=recon_loss_func, beta_rec=beta_rec,
                                                       beta_dyn=beta_dyn, iou_thresh=iou_thresh,
                                                       timestep_horizon=timestep_horizon,
+                                                      animation_horizon=animation_horizon,
                                                       beta_kl=beta_kl, kl_balance=kl_balance, beta_dyn_rec=beta_dyn_rec)
             log_str = f'validation loss: {valid_loss:.3f}\n'
             print(log_str)
@@ -406,11 +458,18 @@ def train_ddlp(config_path='./configs/balls.json'):
                 log_line(log_dir, log_str)
                 best_valid_loss = valid_loss
                 best_valid_epoch = epoch
-                torch.save(model.state_dict(),
+                checkpoint = {
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch
+                }
+                torch.save(checkpoint,
                            os.path.join(save_dir,
                                         f'{ds}_ddlp{run_prefix}_best.pth'))
             torch.cuda.empty_cache()
             if eval_im_metrics and epoch > 0:
+                # Use animation_horizon for image metrics evaluation
                 valid_imm_results = eval_ddlp_im_metric(model, device, config,
                                                         timestep_horizon=animation_horizon, val_mode='val',
                                                         eval_dir=log_dir,
@@ -426,7 +485,13 @@ def train_ddlp(config_path='./configs/balls.json'):
                     log_line(log_dir, log_str)
                     best_val_lpips = val_lpips
                     best_val_lpips_epoch = epoch
-                    torch.save(model.state_dict(),
+                    checkpoint = {
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'epoch': epoch
+                    }
+                    torch.save(checkpoint,
                                os.path.join(save_dir, f'{ds}_ddlp{run_prefix}_best_lpips.pth'))
                 torch.cuda.empty_cache()
         valid_losses.append(valid_loss)
