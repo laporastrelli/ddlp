@@ -65,6 +65,7 @@ figures/
 outputs/
 results/
 samples/
+eval/mds/
 
 # Data directories (large datasets should not be in git)
 data/BALLS_INTERACTION/

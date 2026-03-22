@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.ops as ops
 from typing import Tuple
+import sys
 
 
 def color_map(num=100):
@@ -159,6 +160,7 @@ def reparameterize(mu, logvar):
     return mu + eps * std
 
 
+##################################################################################################################################
 def create_masks_fast(center, anchor_s, feature_dim=16, patch_size=None):
     # center: [batch_size, n_kp, 2] in kp_range
     # anchor_h, anchor_w: size of anchor in [0, 1]
@@ -321,7 +323,11 @@ def get_low_score_bb_single(scores, mode='mean', thresh=0.4, hard_thresh=None):
     return indices
 
 
-def plot_bb_on_image_from_masks_nms(masks, image_tensor, scores, iou_thresh=0.5, thickness=1, hard_thresh=None):
+def plot_bb_on_image_from_masks_nms(
+    masks, image_tensor, scores, iou_thresh=0.5, 
+    thickness=1, hard_thresh=None, return_centres=False, 
+    debug_info=False
+):
     # plot bounding boxes on a single image, use non-maximal suppression to filter low-scoring bbs.
     # masks: [n_masks, 1, feature_dim, feature_dim]
     n_masks = masks.shape[0]
@@ -335,18 +341,48 @@ def plot_bb_on_image_from_masks_nms(masks, image_tensor, scores, iou_thresh=0.5,
     # get bb coor
     bb_from_masks = get_bb_from_masks(masks, width, height)
     coors = bb_from_masks['coor']  # [n_masks, 4]
+
+    # show debug info before thresholding and nms
+    if debug_info:
+        print()
+        print("[DEBUG] BEFORE THRESHOLDING")
+        print(f"[DEBUG] coors shapes  : {bb_from_masks['coor'].shape}")
+        print(f"[DEBUG] centers shape : {bb_from_masks['centers'].shape}")
+        print()
+
     # remove low-score bb
     if hard_thresh is None:
         low_score_ind = get_low_score_bb_single(scores, mode='mean', hard_thresh=2.0)
     else:
         low_score_ind = get_low_score_bb_single(scores, mode='mean', hard_thresh=hard_thresh)
+    
     # nms
     # remove_ind = low_score_ind if hard_thresh is not None else None
     remove_ind = low_score_ind
+    
     # nms
     # remove_ind = low_score_ind if hard_thresh is not None else None
-    coors_nms, nms_indices, scores_nms = nms_single(coors, scores, iou_thresh, return_scores=True,
-                                                    remove_ind=remove_ind)
+    coors_nms, nms_indices, scores_nms = nms_single(
+        coors, scores, iou_thresh, return_scores=True,
+        remove_ind=remove_ind
+    )
+
+    # show debug info after thresholding and nms
+    if debug_info:
+        print("[DEBUG] AFTER THRESHOLDING AND NMS")
+        print(f"[DEBUG] coors_nms shapes  : {torch.stack([coors_nms[i] for i in range(len(coors_nms))], dim=0).shape}")
+        print(f"[DEBUG] centers_nms shape : {bb_from_masks['centers'][nms_indices].shape}")
+        print()
+
+        print(f"[DEBUG] nms_indices entries : {[nms_index for nms_index in nms_indices]}")
+        print()
+
+        print(f"[DEBUG] centers of bbs     : {bb_from_masks['centers']}")
+        print(f"[DEBUG] centers of nms bbs : {bb_from_masks['centers'][nms_indices]}")
+
+        if bb_from_masks['centers'][nms_indices].shape[0] < 2:
+            print("[DEBUG] WARNING: Less than 2 bbs after nms, cannot compute pairwise distances.")
+
     # [n_masks_nms, 4]
     for coor, color in zip(coors_nms, cm):
         c = color.item(0), color.item(1), color.item(2)
@@ -367,24 +403,54 @@ def plot_bb_on_image_from_masks_nms(masks, image_tensor, scores, iou_thresh=0.5,
         cv2.putText(img, score_text, org, font, fontScale, thickness=thickness, color=c, lineType=cv2.LINE_AA)
         count += 1
 
-    return img, nms_indices
+    if return_centres:
+        return img, nms_indices, bb_from_masks['centers'][nms_indices]
+    else:
+        return img, nms_indices
 
 
-def plot_bb_on_image_batch_from_masks_nms(mask_batch_tensor, img_batch_tensor, scores, iou_thresh=0.5, thickness=1,
-                                          max_imgs=8, hard_thresh=None):
+def plot_bb_on_image_batch_from_masks_nms(
+        mask_batch_tensor, img_batch_tensor, scores, iou_thresh=0.5, thickness=1,
+        max_imgs=8, hard_thresh=None, return_centres=False, debug_info=False 
+    ):
+    
     # plot bounding boxes on a batch of images, use non-maximal suppression to filter low-scoring bbs.
     # mask_batch_tensor: [batch_size, n_kp, 1, feature_dim, feature_dim]
+    
     num_plot = min(max_imgs, img_batch_tensor.shape[0])
     img_with_bb = []
     indices = []
+    centres_list = []
+
     for i in range(num_plot):
-        img_np, nms_indices = plot_bb_on_image_from_masks_nms(mask_batch_tensor[i], img_batch_tensor[i], scores[i],
-                                                              iou_thresh, thickness=thickness, hard_thresh=hard_thresh)
+
+        out = plot_bb_on_image_from_masks_nms(
+            mask_batch_tensor[i], img_batch_tensor[i], scores[i],
+            iou_thresh, thickness=thickness, hard_thresh=hard_thresh, 
+            return_centres=return_centres, debug_info=debug_info
+        )
+
+        if return_centres:
+            img_np, nms_indices, centres = out
+        else:
+            img_np, nms_indices = out
+        
         img_tensor = torch.tensor(img_np).float() / 255.0
         img_with_bb.append(img_tensor.permute(2, 0, 1))
         indices.append(nms_indices)
+
+        if return_centres:
+            centres_list.append(centres)
+
     img_with_bb = torch.stack(img_with_bb, dim=0)
-    return img_with_bb, indices
+
+    if return_centres:
+        centres_batch = torch.stack(centres_list, dim=0)
+
+    if return_centres:
+        return img_with_bb, indices, centres_batch
+    else:
+        return img_with_bb, indices
 
 
 def plot_bb_on_image_from_z_scale_nms(kp, z_scale, image_tensor, scores, iou_thresh=0.5, thickness=1, hard_thresh=None,
@@ -498,6 +564,7 @@ def plot_bb_on_image_batch_from_masks(mask_batch_tensor, img_batch_tensor, thick
     img_with_bb = torch.stack(img_with_bb, dim=0)
     return img_with_bb
 
+##################################################################################################################################
 
 def prepare_logdir(runname, src_dir='./', accelerator=None):
     td_prefix = datetime.datetime.now().strftime("%d%m%y_%H%M%S")
@@ -622,6 +689,7 @@ def spatial_transform(image, z_pos, z_scale, out_dims, inverse=False, eps=1e-9):
     # set translation
     theta[:, 0, -1] = z_pos[:, 1] if not inverse else - z_pos[:, 1] / (z_scale[:, 1] + eps)
     theta[:, 1, -1] = z_pos[:, 0] if not inverse else - z_pos[:, 0] / (z_scale[:, 0] + eps)
+    
     # construct sampling grid and sample image from grid
     return affine_grid_sample(image, theta, out_dims, mode='bilinear')
 

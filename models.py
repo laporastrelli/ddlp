@@ -163,6 +163,7 @@ class FgDLP(nn.Module):
         """
         # kp_init: [batch_size, n_kp, 2] in [-1, 1]
         batch_size, ch, h, w = x.shape
+        
         # 0. create or filter anchors
         if kp_init is None:
             # randomly sample n_kp_enc kp
@@ -174,12 +175,14 @@ class FgDLP(nn.Module):
         logvar = torch.zeros_like(mu)
         z_base = mu + 0.0 * logvar  # deterministic value for chamfer-kl
         kp_heatmap = None  # backward compatibility, this is not used
+        
         # 1. posterior offsets and scale, it is okay of scale_prev is None
         scale_in = None if (noisy or warmup) else scale_prev
         cropped_objects_prev = None if (noisy or warmup) else cropped_objects_prev
         particle_stats_dict = self.particle_attribute_enc(x, z_base.detach(),
                                                           previous_objects=cropped_objects_prev,
                                                           z_scale=scale_in)
+        
         # first iteration encodes the refined anchor (z_a), then a second one to lock on target better (z_o)
         if refinement_iter:
             mu_offset = particle_stats_dict['mu']
@@ -198,6 +201,7 @@ class FgDLP(nn.Module):
         else:
             mu_offset = torch.zeros_like(particle_stats_dict['mu'])
             logvar_offset = torch.zeros_like(particle_stats_dict['logvar'])
+        
         mu_scale = particle_stats_dict['mu_scale']
         logvar_scale = particle_stats_dict['logvar_scale']
 
@@ -205,25 +209,14 @@ class FgDLP(nn.Module):
         lobj_on_b = particle_stats_dict['lobj_on_b']
         mu_depth = particle_stats_dict['mu_depth']
         logvar_depth = particle_stats_dict['logvar_depth']
+        
         # final position
         mu_tot = z_base + mu_offset
         logvar_tot = logvar_offset
 
+        # obj_on distribution (Beta)
         obj_on_a = lobj_on_a.exp().clamp_min(1e-5)
         obj_on_b = lobj_on_b.exp().clamp_min(1e-5)
-        # if torch.isnan(obj_on_a).any():
-        #     print(f'obj_on_a has nan')
-        #     # torch.nan_to_num_(obj_on_a, nan=0.01)
-        # if torch.isnan(obj_on_b).any():
-        #     print(f'obj_on_b has nan')
-        #     raise SystemError('NaNs detected')
-        #     # torch.nan_to_num_(obj_on_b, nan=0.01)
-        # try:
-        #     obj_on_beta_dist = torch.distributions.Beta(obj_on_a, obj_on_b)
-        # except ValueError:
-        #     print(f'obj_on_a: {obj_on_a}')
-        #     print(f'obj_on_b: {obj_on_b}')
-        #     raise SystemError
         obj_on_beta_dist = torch.distributions.Beta(obj_on_a, obj_on_b)
 
         # reparameterize
@@ -454,419 +447,6 @@ class FgDLP(nn.Module):
         output_dict['alpha_masks'] = alpha_masks
 
         return output_dict
-
-
-# class FgDDLP(nn.Module):
-#     def __init__(self, cdim=3, enc_channels=(16, 16, 32), prior_channels=(16, 16, 32), image_size=64, n_kp=1,
-#                  pad_mode='replicate', sigma=1.0, dropout=0.0,
-#                  patch_size=16, n_kp_enc=20, n_kp_prior=20, learned_feature_dim=16,
-#                  kp_range=(-1, 1), kp_activation="tanh", anchor_s=0.25,
-#                  use_resblock=False, use_correlation_heatmaps=True, enable_enc_attn=False):
-#         super(FgDDLP, self).__init__()
-#         """
-#         DDLP Foreground Module
-#         Difference from DLP: separate encoders for static and dynamic statistics (e.g. mu/logvar)
-#         cdim: channels of the input image (3...)
-#         enc_channels: channels for the posterior CNN (takes in the whole image)
-#         prior_channels: channels for prior CNN (takes in patches)
-#         n_kp: number of kp to extract from each (!) patch
-#         n_kp_prior: number of kp to filter from the set of prior kp (of size n_kp x num_patches)
-#         n_kp_enc: number of posterior kp to be learned (this is the actual number of kp that will be learnt)
-#         pad_mode: padding for the CNNs, 'zeros' or  'replicate' (default)
-#         sigma: the prior std of the KP
-#         dropout: dropout for the CNNs. We don't use it though...
-#         patch_size: patch size for the prior KP proposals network (not to be confused with the glimpse size)
-#         kp_range: the range of keypoints, can be [-1, 1] (default) or [0,1]
-#         learned_feature_dim: the latent visual features dimensions extracted from glimpses.
-#         kp_activation: the type of activation to apply on the keypoints: "tanh" for kp_range [-1, 1], "sigmoid" for [0, 1]
-#         anchor_s: defines the glimpse size as a ratio of image_size (e.g., 0.25 for image_size=128 -> glimpse_size=32)
-#         use_correlation_heatmaps: use correlation heatmaps as input to model particle properties (e.g., xy offset)
-#         enable_enc_attn: enable attention between patches features in the particle encoder
-#         """
-#         self.image_size = image_size
-#         self.sigma = sigma
-#         self.dropout = dropout
-#         self.kp_range = kp_range
-#         self.num_patches = int((image_size // patch_size) ** 2)
-#         self.n_kp = n_kp
-#         self.n_kp_total = self.n_kp * self.num_patches
-#         self.n_kp_prior = min(self.n_kp_total, n_kp_prior)
-#         self.n_kp_enc = n_kp_enc
-#         self.kp_activation = kp_activation
-#         self.patch_size = patch_size
-#         self.anchor_patch_s = patch_size / image_size
-#         self.features_dim = int(image_size // (2 ** (len(enc_channels) - 1)))
-#         self.learned_feature_dim = learned_feature_dim
-#         assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
-#         self.anchor_s = anchor_s
-#         self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
-#         self.exclusive_patches = False
-#         self.cdim = cdim
-#         self.use_resblock = use_resblock
-#         self.use_correlation_heatmaps = use_correlation_heatmaps
-#         self.enable_enc_attn = enable_enc_attn
-#
-#         # prior
-#         self.prior = VariationalKeyPointPatchEncoder(cdim=cdim, channels=prior_channels, image_size=image_size,
-#                                                      n_kp=n_kp, kp_range=self.kp_range,
-#                                                      patch_size=patch_size,
-#                                                      pad_mode=pad_mode, sigma=sigma, dropout=dropout,
-#                                                      learnable_logvar=False, learned_feature_dim=0,
-#                                                      use_resblock=self.use_resblock)
-#
-#         # posterior encoder
-#         self.particle_attribute_enc = ParticleAttributeEncoder(anchor_size=anchor_s, image_size=image_size,
-#                                                                margin=0, ch=cdim,
-#                                                                kp_activation=kp_activation,
-#                                                                use_resblock=self.use_resblock,
-#                                                                max_offset=1.0, cnn_channels=prior_channels,
-#                                                                use_correlation_heatmaps=use_correlation_heatmaps,
-#                                                                enable_attn=self.enable_enc_attn, attn_dropout=0.0)
-#         self.particle_attribute_enc_dyn = ParticleAttributeEncoder(anchor_size=anchor_s, image_size=image_size,
-#                                                                    margin=0, ch=cdim,
-#                                                                    kp_activation=kp_activation,
-#                                                                    use_resblock=self.use_resblock,
-#                                                                    max_offset=1.0, cnn_channels=prior_channels,
-#                                                                    use_correlation_heatmaps=use_correlation_heatmaps,
-#                                                                    enable_attn=self.enable_enc_attn, attn_dropout=0.0)
-#         self.particle_features_enc = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
-#                                                              image_size,
-#                                                              cnn_channels=prior_channels,
-#                                                              margin=0, enable_attn=self.enable_enc_attn,
-#                                                              attn_dropout=0.0)
-#         self.particle_features_enc_dyn = ParticleFeaturesEncoder(anchor_s, learned_feature_dim,
-#                                                                  image_size,
-#                                                                  cnn_channels=prior_channels,
-#                                                                  margin=0, enable_attn=self.enable_enc_attn,
-#                                                                  attn_dropout=0.0)
-#
-#         # object decoder
-#         self.object_dec = ObjectDecoderCNN(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=4,
-#                                            bottleneck_size=learned_feature_dim, use_resblock=self.use_resblock)
-#         self.init_weights()
-#
-#     def get_parameters(self, prior=True, encoder=True, decoder=True):
-#         parameters = []
-#         if prior:
-#             parameters.extend(list(self.prior.parameters()))
-#         if encoder:
-#             parameters.extend(list(self.particle_attribute_enc.parameters()))
-#             parameters.extend(list(self.particle_features_enc.parameters()))
-#             parameters.extend(list(self.particle_attribute_enc_dyn.parameters()))
-#             parameters.extend(list(self.particle_features_enc_dyn.parameters()))
-#         if decoder:
-#             parameters.extend(list(self.object_dec.parameters()))
-#         return parameters
-#
-#     def set_require_grad(self, prior_value=True, enc_value=True, dec_value=True):
-#         # prior
-#         for param in self.prior.parameters():
-#             param.requires_grad = prior_value
-#         # encoder
-#         for param in self.particle_attribute_enc.parameters():
-#             param.requires_grad = enc_value
-#         for param in self.particle_attribute_enc_dyn.parameters():
-#             param.requires_grad = enc_value
-#         for param in self.particle_features_enc.parameters():
-#             param.requires_grad = enc_value
-#         for param in self.particle_features_enc_dyn.parameters():
-#             param.requires_grad = enc_value
-#         # decoder
-#         for param in self.object_dec.parameters():
-#             param.requires_grad = dec_value
-#
-#     def init_weights(self):
-#         for m in self.modules():
-#             if isinstance(m, nn.Conv2d):
-#                 nn.init.normal_(m.weight, 0, 0.01)
-#                 if m.bias is not None:
-#                     nn.init.constant_(m.bias, 0)
-#             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-#                 nn.init.constant_(m.weight, 1)
-#                 nn.init.constant_(m.bias, 0)
-#             elif isinstance(m, nn.Linear):
-#                 # use pytorch's default
-#                 pass
-#
-#     def encode_all(self, x, deterministic=False, noisy=False, warmup=False, kp_init=None, cropped_objects_prev=None,
-#                    scale_prev=None, refinement_iter=False, use_static_encoders=True):
-#         """
-#         2-stage encoding:
-#         0. if kp_init is None: create evenly spaced anchors. kp_init is z_base.
-#         1. offset and scale encoding: produces offset and scale [mu, logvar].
-#         2. attributes encoding: obj_on, depth and features [obj_on_a, obj_on_b] / [mu, logvar]
-#         """
-#         # kp_init: [batch_size, n_kp, 2] in [-1, 1]
-#         batch_size, ch, h, w = x.shape
-#         # 0. create or filter anchors
-#         if kp_init is None:
-#             # randomly sample n_kp_enc kp
-#             mu = torch.rand(batch_size, self.n_kp_enc, 2, device=x.device) * 2 - 1  # in [-1, 1]
-#         elif kp_init.shape[1] > self.n_kp_enc:
-#             mu = kp_init[:, :self.n_kp_enc]
-#         else:
-#             mu = kp_init
-#         logvar = torch.zeros_like(mu)
-#         z_base = mu + 0.0 * logvar  # deterministic value for chamfer-kl
-#         kp_heatmap = None  # backward compatibility, this is not used
-#
-#         attribute_enc = self.particle_attribute_enc if use_static_encoders else self.particle_attribute_enc_dyn
-#         features_enc = self.particle_features_enc if use_static_encoders else self.particle_features_enc_dyn
-#         # 1. posterior offsets and scale, it is okay of scale_prev is None
-#         particle_stats_dict = attribute_enc(x, z_base.detach(), previous_objects=cropped_objects_prev,
-#                                             z_scale=scale_prev)
-#         # "second chance" to lock on target better
-#         if refinement_iter:
-#             mu_offset = particle_stats_dict['mu']
-#             mu = z_base + mu_offset  # TODO: mu_offset.detach()?
-#             z_base = mu + 0.0 * logvar
-#             if scale_prev is None:
-#                 scale_prev = particle_stats_dict['mu_scale']
-#             particle_stats_dict = attribute_enc(x, z_base.detach(),
-#                                                 previous_objects=cropped_objects_prev,
-#                                                 z_scale=scale_prev.detach())
-#         mu_offset = particle_stats_dict['mu']
-#         logvar_offset = particle_stats_dict['logvar']
-#         mu_scale = particle_stats_dict['mu_scale']
-#         logvar_scale = particle_stats_dict['logvar_scale']
-#
-#         lobj_on_a = particle_stats_dict['lobj_on_a']
-#         lobj_on_b = particle_stats_dict['lobj_on_b']
-#         mu_depth = particle_stats_dict['mu_depth']
-#         logvar_depth = particle_stats_dict['logvar_depth']
-#         # final position
-#         mu_tot = z_base + mu_offset
-#         logvar_tot = logvar_offset
-#
-#         obj_on_a = lobj_on_a.exp().clamp_min(1e-5)
-#         obj_on_b = lobj_on_b.exp().clamp_min(1e-5)
-#         if torch.isnan(obj_on_a).any():
-#             print(f'obj_on_a has nan')
-#             torch.nan_to_num_(obj_on_a, nan=0.01)
-#         if torch.isnan(obj_on_b).any():
-#             print(f'obj_on_b has nan')
-#             torch.nan_to_num_(obj_on_b, nan=0.01)
-#         obj_on_beta_dist = torch.distributions.Beta(obj_on_a, obj_on_b)
-#
-#         # reparameterize
-#         if deterministic:
-#             z = mu_tot
-#             z_offset = mu_offset
-#             z_scale = mu_scale
-#             z_depth = mu_depth
-#             z_obj_on = obj_on_beta_dist.mean
-#         else:
-#             z = reparameterize(mu_tot, logvar_tot)
-#             z_offset = reparameterize(mu_offset, logvar_offset)  # not used
-#             z_scale = reparameterize(mu_scale, logvar_scale)
-#             z_depth = reparameterize(mu_depth, logvar_depth)
-#             z_obj_on = obj_on_beta_dist.rsample()
-#
-#         # during warm-up and noisy stages we use small values around the patch size for the scale
-#         if z_scale is not None and noisy:
-#             anchor_size = self.anchor_s
-#             z_scale = 0.0 * z_scale + (np.log(anchor_size / (1 - anchor_size + 1e-5)) + 0.3 * torch.randn_like(z_scale))
-#         # to avoid null cases where obj_on -> 0, we noise its values during the noisy stage
-#         # z_obj_on = z_obj_on if not noisy else (z_obj_on + self.sigma * torch.randn_like(z_obj_on)).clamp(0, 1)
-#
-#         if warmup:
-#             z_base = z_base.detach()
-#             z = z.detach()
-#             z_scale = z_scale.detach()
-#
-#         # 2. posterior attributes: obj_on, depth and visual features
-#         obj_enc_out = features_enc(x, z, z_scale=z_scale.detach())
-#
-#         mu_features = obj_enc_out['mu_features']
-#         logvar_features = obj_enc_out['logvar_features']
-#         cropped_objects = obj_enc_out['cropped_objects']
-#
-#         # reparameterize
-#         if deterministic:
-#             z_features = mu_features
-#         else:
-#             z_features = reparameterize(mu_features, logvar_features)
-#
-#         encode_dict = {'mu': mu, 'logvar': logvar, 'z_base': z_base, 'z': z, 'kp_heatmap': kp_heatmap,
-#                        'mu_features': mu_features, 'logvar_features': logvar_features, 'z_features': z_features,
-#                        'obj_on_a': obj_on_a, 'obj_on_b': obj_on_b, 'obj_on': z_obj_on,
-#                        'mu_depth': mu_depth, 'logvar_depth': logvar_depth, 'z_depth': z_depth,
-#                        'cropped_objects': cropped_objects,
-#                        'mu_scale': mu_scale, 'logvar_scale': logvar_scale, 'z_scale': z_scale,
-#                        'mu_offset': mu_offset, 'logvar_offset': logvar_offset, 'z_offset': z_offset}
-#         return encode_dict
-#
-#     def encode_prior(self, x, x_prior=None, filtering_heuristic='variance', k=None):
-#         if k is None:
-#             k = self.n_kp_prior
-#         if x_prior is None:
-#             x_prior = x
-#         kp_p, var_kp_p = self.prior(x_prior, global_kp=True)
-#         kp_p = kp_p.view(x_prior.shape[0], -1, 2)  # [batch_size, n_kp_total, 2]
-#         var_kp_p = var_kp_p.view(x_prior.shape[0], kp_p.shape[1], -1)  # [batch_size, n_kp_total, 3]
-#         if filtering_heuristic == 'distance':
-#             # filter proposals by distance to the patches' center
-#             dist_from_center = self.prior.get_distance_from_patch_centers(kp_p, global_kp=True)
-#             _, indices = torch.topk(dist_from_center, k=k, dim=-1, largest=True)
-#             batch_indices = torch.arange(kp_p.shape[0]).view(-1, 1).to(kp_p.device)
-#             kp_p = kp_p[batch_indices, indices]
-#         elif filtering_heuristic == 'variance':
-#             total_var = var_kp_p.sum(-1)
-#             _, indices = torch.topk(total_var, k=k, dim=-1, largest=False)
-#             batch_indices = torch.arange(kp_p.shape[0]).view(-1, 1).to(kp_p.device)
-#             kp_p = kp_p[batch_indices, indices]
-#         else:
-#             # alternatively, just sample random kp
-#             kp_p = kp_p[:, torch.randperm(kp_p.shape[1])[:k]]
-#         return kp_p
-#
-#     def translate_patches(self, kp_batch, patches_batch, scale=None, translation=None, scale_normalized=False):
-#         """
-#         translate patches to be centered around given keypoints
-#         kp_batch: [bs, n_kp, 2] in [-1, 1]
-#         patches: [bs, n_kp, ch_patches, patch_size, patch_size]
-#         scale: None or [bs, n_kp, 2] or [bs, n_kp, 1]
-#         translation: None or [bs, n_kp, 2] or [bs, n_kp, 1] (delta from kp)
-#         scale_normalized: False if scale is not in [0, 1]
-#         :return: translated_padded_pathces [bs, n_kp, ch, img_size, img_size]
-#         """
-#         batch_size, n_kp, ch_patch, patch_size, _ = patches_batch.shape
-#         img_size = self.image_size
-#         if scale is None:
-#             z_scale = (patch_size / img_size) * torch.ones_like(kp_batch)
-#         else:
-#             # normalize to [0, 1]
-#             if scale_normalized:
-#                 z_scale = scale
-#             else:
-#                 z_scale = torch.sigmoid(scale)  # -> [0, 1]
-#         z_pos = kp_batch.reshape(-1, kp_batch.shape[-1])  # [bs * n_kp, 2]
-#         z_scale = z_scale.view(-1, z_scale.shape[-1])  # [bs * n_kp, 2]
-#         patches_batch = patches_batch.reshape(-1, *patches_batch.shape[2:])
-#         out_dims = (batch_size * n_kp, ch_patch, img_size, img_size)
-#         trans_patches_batch = spatial_transform(patches_batch, z_pos, z_scale, out_dims, inverse=True)
-#         trans_padded_patches_batch = trans_patches_batch.view(batch_size, n_kp, *trans_patches_batch.shape[1:])
-#         # [bs, n_kp, ch, img_size, img_size]
-#         return trans_padded_patches_batch
-#
-#     def get_objects_alpha_rgb(self, z_kp, z_features, z_scale=None, translation=None, noisy=False):
-#         dec_objects = self.object_dec(z_features)  # [bs * n_kp, 4, patch_size, patch_size]
-#         dec_objects = dec_objects.view(-1, self.n_kp_enc,
-#                                        *dec_objects.shape[1:])  # [bs, n_kp, 4, patch_size, patch_size]
-#         # translate patches
-#         dec_objects_trans = self.translate_patches(z_kp, dec_objects, z_scale, translation)
-#         dec_objects_trans = dec_objects_trans.clamp(0, 1)  # STN can change values to be < 0
-#         # dec_objects_trans: [bs, n_kp, 3, im_size, im_size]
-#         # multiply by alpha channel
-#         a_obj, rgb_obj = torch.split(dec_objects_trans, [1, 3], dim=2)
-#
-#         if noisy:
-#             a_obj = a_obj + 0.1 * torch.randn_like(a_obj)
-#             a_obj = a_obj.clamp(0, 1)
-#         return dec_objects, a_obj, rgb_obj
-#
-#     def get_objects_alpha_rgb_with_depth(self, a_obj, rgb_obj, obj_on, z_depth, eps=1e-5):
-#         # obj_on: [bs, n_kp, 1]
-#         # z_depth: [bs, n_kp, 1]
-#         # turn off inactive particles
-#         a_obj = obj_on[:, :, None, None, None] * a_obj  # [bs, n_kp, 1, im_size, im_size]
-#         rgba_obj = a_obj * rgb_obj
-#         # importance map
-#         importance_map = a_obj * torch.sigmoid(-z_depth[:, :, :, None, None])
-#         # normalize
-#         importance_map = importance_map / (torch.sum(importance_map, dim=1, keepdim=True) + eps)
-#         # this imitates softmax
-#         dec_objects_trans = (rgba_obj * importance_map).sum(dim=1)
-#         alpha_mask = 1.0 - (importance_map * a_obj).sum(dim=1)
-#         a_obj = importance_map * a_obj
-#         return a_obj, alpha_mask, dec_objects_trans
-#
-#     def decode_objects(self, z_kp, z_features, obj_on, z_scale=None, translation=None, noisy=False, z_depth=None):
-#         dec_objects, a_obj, rgb_obj = self.get_objects_alpha_rgb(z_kp, z_features, z_scale=z_scale,
-#                                                                  translation=translation, noisy=noisy)
-#         alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(a_obj, rgb_obj, obj_on=obj_on,
-#                                                                                         z_depth=z_depth)
-#         return dec_objects, dec_objects_trans, alpha_masks, bg_mask
-#
-#     def decode_all(self, z, z_features, obj_on, z_depth=None, noisy=False, z_scale=None):
-#         object_dec_out = self.decode_objects(z, z_features, obj_on, noisy=noisy, z_depth=z_depth, z_scale=z_scale)
-#         dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
-#
-#         decoder_out = {'dec_objects': dec_objects, 'dec_objects_trans': dec_objects_trans,
-#                        'bg_mask': bg_mask, 'alpha_masks': alpha_masks}
-#
-#         return decoder_out
-#
-#     def forward(self, x, deterministic=False, x_prior=None, warmup=False, noisy=False,
-#                 cropped_objects_prev=None, mu_scale_prev=None, train_prior=True, refinement_iter=False,
-#                 use_static_encoders=True):
-#         # refinement_iter: do another encoding step to get a better lock on the object's position
-#         # first, extract prior KP proposals
-#         # prior proposals
-#         kp_p = self.encode_prior(x, x_prior=x_prior, filtering_heuristic='variance')
-#         kp_init = kp_p if train_prior else kp_p.detach()
-#         encoder_out = self.encode_all(x, deterministic=deterministic, noisy=noisy, warmup=warmup, kp_init=kp_init,
-#                                       cropped_objects_prev=cropped_objects_prev, scale_prev=mu_scale_prev,
-#                                       refinement_iter=refinement_iter, use_static_encoders=use_static_encoders)
-#         # detach for the kl-divergence
-#         kp_p = kp_p.detach()
-#         mu = encoder_out['mu']
-#         logvar = encoder_out['logvar']
-#         z_base = encoder_out['z_base']
-#         z = encoder_out['z']
-#         mu_offset = encoder_out['mu_offset']
-#         logvar_offset = encoder_out['logvar_offset']
-#         z_offset = encoder_out['z_offset']
-#         kp_heatmap = encoder_out['kp_heatmap']
-#         mu_features = encoder_out['mu_features']
-#         logvar_features = encoder_out['logvar_features']
-#         z_features = encoder_out['z_features']
-#         obj_on = encoder_out['obj_on']
-#         obj_on_a = encoder_out['obj_on_a']
-#         obj_on_b = encoder_out['obj_on_b']
-#         mu_depth = encoder_out['mu_depth']
-#         logvar_depth = encoder_out['logvar_depth']
-#         z_depth = encoder_out['z_depth']
-#         cropped_objects = encoder_out['cropped_objects']
-#         mu_scale = encoder_out['mu_scale']
-#         logvar_scale = encoder_out['logvar_scale']
-#         z_scale = encoder_out['z_scale']
-#
-#         obj_on_sample = obj_on
-#
-#         decoder_out = self.decode_all(z, z_features, obj_on_sample, z_depth, noisy=noisy, z_scale=z_scale)
-#         dec_objects = decoder_out['dec_objects']
-#         dec_objects_trans = decoder_out['dec_objects_trans']
-#         bg_mask = decoder_out['bg_mask']
-#         alpha_masks = decoder_out['alpha_masks']
-#
-#         output_dict = {}
-#         output_dict['kp_p'] = kp_p
-#         output_dict['mu'] = mu
-#         output_dict['logvar'] = logvar
-#         output_dict['z_base'] = z_base
-#         output_dict['z'] = z
-#         output_dict['mu_offset'] = mu_offset
-#         output_dict['logvar_offset'] = logvar_offset
-#         output_dict['mu_features'] = mu_features
-#         output_dict['logvar_features'] = logvar_features
-#         output_dict['z_features'] = z_features
-#         output_dict['bg_mask'] = bg_mask
-#         output_dict['cropped_objects_original'] = cropped_objects
-#         output_dict['obj_on_a'] = obj_on_a
-#         output_dict['obj_on_b'] = obj_on_b
-#         output_dict['obj_on'] = obj_on
-#         output_dict['dec_objects_original'] = dec_objects
-#         output_dict['dec_objects'] = dec_objects_trans
-#         output_dict['mu_depth'] = mu_depth
-#         output_dict['logvar_depth'] = logvar_depth
-#         output_dict['z_depth'] = z_depth
-#         output_dict['mu_scale'] = mu_scale
-#         output_dict['logvar_scale'] = logvar_scale
-#         output_dict['z_scale'] = z_scale
-#         output_dict['alpha_masks'] = alpha_masks
-#
-#         return output_dict
 
 
 class BgDLP(nn.Module):
@@ -1660,12 +1240,12 @@ class ObjectDynamicsDLP(nn.Module):
         cdim: channels of the input image (3...)
         enc_channels: channels for the posterior CNN (takes in the whole image)
         prior_channels: channels for prior CNN (takes in patches)
-        n_kp: number of kp to extract from each (!) patch
+        n_kp: number of kp to extract from ***each (!) patch***
         n_kp_prior: number of kp to filter from the set of prior kp (of size n_kp x num_patches)
         n_kp_enc: number of posterior kp to be learned (this is the actual number of kp that will be learnt)
         pad_mode: padding for the CNNs, 'zeros' or  'replicate' (default)
         sigma: the prior std of the KP
-        dropout: dropout for the CNNs. We don't use it though...
+        dropout: dropout for the CNNs. ***We don't use it though...***
         patch_size: patch size for the prior KP proposals network (not to be confused with the glimpse size)
         kp_range: the range of keypoints, can be [-1, 1] (default) or [0,1]
         learned_feature_dim: the latent visual features dimensions extracted from glimpses.
@@ -1680,7 +1260,7 @@ class ObjectDynamicsDLP(nn.Module):
         pint_heads: number of transformer heads in the dynamics module
         enable_enc_attn: enable attention between patches in the particle encoder
         use_correlation_heatmaps: use correlation heatmaps for tracking
-        filtering heuristic: filtering heuristic to filter prior keypoints,['distance', 'variance', 'random', 'none']
+        filtering_heuristic: filtering heuristic to filter prior keypoints,['distance', 'variance', 'random', 'none']
         """
         self.image_size = image_size
         self.sigma = sigma
@@ -2250,7 +1830,7 @@ class ObjectDynamicsDLP(nn.Module):
         return output_dict
 
     def fg_sequential_opt(self, x, deterministic=False, x_prior=None, warmup=False, noisy=False, reshape=True,
-                          train_prior=False, num_static_frames=4):
+                          train_prior=False, num_static_frames=4, continuation_state=None):
         """
         sequential encoding (+ object decoding) per-timestep, for tracking purposes
         reshape: whether to reshape to [bs * timestep_horizon, ...]
@@ -2260,39 +1840,65 @@ class ObjectDynamicsDLP(nn.Module):
         """
         # x: [bs, T + 1, ...]
         batch_size, timestep_horizon = x.size(0), x.size(1)
-        num_static_frames = min(num_static_frames, timestep_horizon)
         if x_prior is None:
             x_prior = x
-        # for the first time step, standard encoding
-        filtering_heuristic = self.filtering_heuristic
-        kp_p = self.fg_module.encode_prior(x[:, :num_static_frames].reshape(-1, *x.shape[2:]),
-                                           x_prior=x_prior[:, :num_static_frames].reshape(-1, *x_prior.shape[2:]),
-                                           filtering_heuristic=filtering_heuristic)
-        kp_p = kp_p.reshape(batch_size, num_static_frames, *kp_p.shape[1:])  # [bs, n_stat_frames, n_kp_p, 2]
-        kp_p = kp_p if train_prior else (0.0 * kp_p + kp_p.detach())  # 0.0 * kp_p for distributed training
-        kp_init = kp_p[:, 0]  # first timestep
-        if self.filtering_heuristic == 'none':
-            # n_kp_prior -> n_kp_enc
-            kp_init = self.particle_mixer(x[:, 0], kp_init)
-        fg_dict = self.fg_module.encode_all(x[:, 0], deterministic=deterministic, warmup=warmup, noisy=noisy,
-                                            kp_init=kp_init, refinement_iter=True)
-        kp_p = kp_p.detach()  # freeze w.r.t to kl-divergence
+
+        if continuation_state is not None:
+            kp_init = continuation_state['kp_init']
+            cropped_objects_prev = continuation_state['cropped_objects_prev']
+            scale_prev = continuation_state['scale_prev']
+
+            fg_dict = self.fg_module.encode_all(
+                x[:, 0], deterministic=deterministic, 
+                warmup=warmup, noisy=noisy,
+                kp_init=kp_init, refinement_iter=True, 
+                cropped_objects_prev=cropped_objects_prev, 
+                scale_prev=scale_prev
+            )
+
+        else:
+            num_static_frames = min(num_static_frames, timestep_horizon)
+            
+            # prior keypoints proposal generation from static frames
+            filtering_heuristic = self.filtering_heuristic
+            kp_p = self.fg_module.encode_prior(x[:, :num_static_frames].reshape(-1, *x.shape[2:]),
+                                            x_prior=x_prior[:, :num_static_frames].reshape(-1, *x_prior.shape[2:]),
+                                            filtering_heuristic=filtering_heuristic)
+            kp_p = kp_p.reshape(batch_size, num_static_frames, *kp_p.shape[1:])  # [bs, n_stat_frames, n_kp_p, 2]
+            kp_p = kp_p if train_prior else (0.0 * kp_p + kp_p.detach())  # 0.0 * kp_p for distributed training
+            
+            kp_init = kp_p[:, 0]  # first timestep
+            if self.filtering_heuristic == 'none':
+                # n_kp_prior -> n_kp_enc
+                kp_init = self.particle_mixer(x[:, 0], kp_init)
+            fg_dict = self.fg_module.encode_all(x[:, 0], deterministic=deterministic, warmup=warmup, noisy=noisy,
+                                                kp_init=kp_init, refinement_iter=True)
+            
+            kp_p = kp_p.detach()  # freeze w.r.t to kl-divergence
+        
         mu = fg_dict['mu']
         logvar = fg_dict['logvar']
+
         z_base = fg_dict['z_base']
         z = fg_dict['z']
+
         mu_offset = fg_dict['mu_offset']
         logvar_offset = fg_dict['logvar_offset']
+
         mu_features = fg_dict['mu_features']
         logvar_features = fg_dict['logvar_features']
         z_features = fg_dict['z_features']
+
         cropped_objects = fg_dict['cropped_objects']
+
         obj_on_a = fg_dict['obj_on_a']
         obj_on_b = fg_dict['obj_on_b']
         z_obj_on = fg_dict['obj_on']
+
         mu_depth = fg_dict['mu_depth']
         logvar_depth = fg_dict['logvar_depth']
         z_depth = fg_dict['z_depth']
+        
         mu_scale = fg_dict['mu_scale']
         logvar_scale = fg_dict['logvar_scale']
         z_scale = fg_dict['z_scale']
@@ -2357,11 +1963,17 @@ class ObjectDynamicsDLP(nn.Module):
             z_scales.append(z_scale)
 
         # pad the kp proposals (prior) tensor, only care about t=[0, num_static_frames]
-        num_pad = len(mus) - kp_p.shape[1]
-        if num_pad > 0:
-            kp_p_pad = kp_p[:, -1:].detach()
-            kp_p = torch.cat([kp_p, kp_p_pad.repeat(1, num_pad, 1, 1)], dim=1)
-        kp_ps = kp_p
+        # Only needed when we generated prior proposals (continuation_state is None)
+        if continuation_state is None:
+            num_pad = len(mus) - kp_p.shape[1]
+            if num_pad > 0:
+                kp_p_pad = kp_p[:, -1:].detach()
+                kp_p = torch.cat([kp_p, kp_p_pad.repeat(1, num_pad, 1, 1)], dim=1)
+            kp_ps = kp_p
+        else:
+            # No prior proposals when using continuation state
+            kp_ps = None
+        
         mus = torch.stack(mus, dim=1)
         logvars = torch.stack(logvars, dim=1)
         z_bases = torch.stack(z_bases, dim=1)
@@ -2397,8 +2009,17 @@ class ObjectDynamicsDLP(nn.Module):
         alpha_maskss = decoder_out['alpha_masks']
 
         if reshape:
+            
+            continuation_state_out = {
+                'kp_init': zs[:, -1],  # Last frame's total positions [B, n_kp, 2]
+                'cropped_objects_prev': cropped_objectss[:, -1].reshape(-1, *cropped_objectss.shape[3:]),  # Last frame's cropped patches [B*n_kp, C, H, W] - FLATTENED
+                'scale_prev': z_scales[:, -1],  # Last frame's scale [B, n_kp, 2]
+                'z_features_prev': z_featuress[:, -1]  # Last frame's features [B, n_kp, feature_dim]
+            }
+
             # reshape to [bs * timestep_horizon, ...]
-            kp_ps = kp_ps.view(-1, *kp_ps.shape[2:])
+            if kp_ps is not None:
+                kp_ps = kp_ps.view(-1, *kp_ps.shape[2:])
             mus = mus.view(-1, *mus.shape[2:])
             logvars = logvars.view(-1, *logvars.shape[2:])
             z_bases = z_bases.view(-1, *z_bases.shape[2:])
@@ -2418,6 +2039,7 @@ class ObjectDynamicsDLP(nn.Module):
             mu_scales = mu_scales.view(-1, *mu_scales.shape[2:])
             logvar_scales = logvar_scales.view(-1, *logvar_scales.shape[2:])
             z_scales = z_scales.view(-1, *z_scales.shape[2:])
+
         else:
             # reshape to [bs, timestep_horizon, ...]
             bg_masks = bg_masks.view(-1, timestep_horizon, *bg_masks.shape[1:])
@@ -2425,17 +2047,24 @@ class ObjectDynamicsDLP(nn.Module):
             dec_objects_transs = dec_objects_transs.view(-1, timestep_horizon, *dec_objects_transs.shape[1:])
             alpha_maskss = alpha_maskss.view(-1, timestep_horizon, *alpha_maskss.shape[1:])
 
+            continuation_state_out = {
+                'kp_init': zs[:, -1],  # Last frame's total positions [B, n_kp, 2]
+                'cropped_objects_prev': cropped_objectss[:, -1].reshape(-1, *cropped_objectss.shape[3:]),  # Last frame's cropped patches [B*n_kp, C, H, W] - FLATTENED
+                'scale_prev': z_scales[:, -1],  # Last frame's scale [B, n_kp, 2]
+                'z_features_prev': z_featuress[:, -1]  # Last frame's features [B, n_kp, feature_dim]
+            }
+
         output_dict = {'kp_p': kp_ps, 'mu': mus, 'logvar': logvars, 'z_base': z_bases, 'z': zs, 'mu_offset': mu_offsets,
                        'logvar_offset': logvar_offsets, 'mu_features': mu_featuress,
                        'logvar_features': logvar_featuress, 'z_features': z_featuress, 'bg_mask': bg_masks,
                        'cropped_objects_original': cropped_objectss, 'obj_on_a': obj_on_as, 'obj_on_b': obj_on_bs,
                        'obj_on': z_obj_ons, 'dec_objects_original': dec_objectss, 'dec_objects': dec_objects_transs,
                        'mu_depth': mu_depths, 'logvar_depth': logvar_depths, 'z_depth': z_depths, 'mu_scale': mu_scales,
-                       'logvar_scale': logvar_scales, 'z_scale': z_scales, 'alpha_masks': alpha_maskss}
+                       'logvar_scale': logvar_scales, 'z_scale': z_scales, 'alpha_masks': alpha_maskss, "continuation_state": continuation_state_out}
         return output_dict
 
     def forward(self, x, deterministic=False, bg_masks_from_fg=False, x_prior=None, warmup=False, noisy=False,
-                forward_dyn=True, train_enc_prior=True, num_static_frames=4):
+                forward_dyn=True, train_enc_prior=True, num_static_frames=4, continuation_state=None):
         # x: [bs, T + 1, ...]
         batch_size, timestep_horizon = x.size(0), x.size(1)
         # timestep_horizon = timestep_horizon - 1
@@ -2446,7 +2075,8 @@ class ObjectDynamicsDLP(nn.Module):
             fg_dict = self.fg_sequential_opt(x, deterministic=deterministic, x_prior=x_prior, warmup=warmup,
                                              noisy=noisy,
                                              reshape=True, train_prior=train_enc_prior,
-                                             num_static_frames=num_static_frames)
+                                             num_static_frames=num_static_frames, 
+                                             continuation_state=continuation_state)
         else:
             # static
             x_prior = x_in
@@ -2588,6 +2218,9 @@ class ObjectDynamicsDLP(nn.Module):
         output_dict['logvar_scale_dyn'] = logvar_scale_dyn
         output_dict['mu_bg_dyn'] = mu_bg_features_dyn
         output_dict['logvar_bg_dyn'] = logvar_bg_features_dyn
+
+        # add-on: continuation state if exists
+        output_dict['continuation_state'] = fg_dict['continuation_state']
 
         return output_dict
 

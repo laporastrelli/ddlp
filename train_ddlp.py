@@ -37,6 +37,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     except FileNotFoundError:
         raise SystemExit("config file not found")
     hparams = config  # to save a copy of the hyper-parameters
+    
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
@@ -63,6 +64,7 @@ def train_ddlp(config_path='./configs/balls.json'):
         device = torch.device(f'{device}' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device('cpu')
+    
     # model
     timestep_horizon = config['timestep_horizon']
     kp_range = config['kp_range']
@@ -70,7 +72,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     enc_channels = config['enc_channels']
     prior_channels = config['prior_channels']
     pad_mode = config['pad_mode']
-    n_kp = config['n_kp']  # kp per patch in prior, best to leave at 1
+    n_kp = config['n_kp']  # kp **per patch** in prior, best to leave at 1
     n_kp_prior = config['n_kp_prior']  # number of prior kp to filter for the kl
     n_kp_enc = config['n_kp_enc']  # total posterior kp
     patch_size = config['patch_size']  # prior patch size
@@ -124,9 +126,12 @@ def train_ddlp(config_path='./configs/balls.json'):
                               pint_dim=pint_dim, use_correlation_heatmaps=use_correlation_heatmaps,
                               enable_enc_attn=enable_enc_attn, filtering_heuristic=filtering_heuristic).to(device)
     print(model.info())
+
     # prepare saving location
     run_name = f'{ds}_ddlp' + run_prefix
-    log_dir = prepare_logdir(runname=run_name, src_dir='./')
+    log_dir = prepare_logdir(runname=run_name, src_dir='./outputs')
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
     fig_dir = os.path.join(log_dir, 'figures')
     save_dir = os.path.join(log_dir, 'saves')
     save_config(log_dir, hparams)
@@ -141,6 +146,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     optimizer = optim.Adam(model.get_parameters(), lr=lr, betas=adam_betas, eps=adam_eps, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=scheduler_gamma, verbose=True)
 
+    # load pretrained model
     if load_model and pretrained_path is not None:
         try:
             checkpoint = torch.load(pretrained_path, map_location=device)
@@ -221,7 +227,6 @@ def train_ddlp(config_path='./configs/balls.json'):
     iter_per_step = dynamics_warmup_iters // timestep_horizon
     max_iterations_per_step = [iter_per_step * (i + 1) for i in range(timestep_horizon)]
     iteration = 0  # initialize iterations counter
-    start_epoch = 0  # will be updated if loading from checkpoint
 
     for epoch in range(num_epochs):
         model.train()
@@ -238,14 +243,18 @@ def train_ddlp(config_path='./configs/balls.json'):
 
         pbar = tqdm(iterable=dataloader)
         for batch in pbar:
-            x = batch[0].to(device)
+
+            # prepare model inputs
+            x = batch[0].to(device) # get video of size [batch_size, seq_len, ch, h, w] 
             x_prior = x  # the input image to the prior is the same as the posterior
             noisy = (epoch < (warmup_epoch + 1))
             forward_dyn = (epoch >= start_epoch)  # forward through the dynamics module
-            # forward pass
+            
+            # iteration-wise forward pass
             model_output = model(x, x_prior=x_prior, warmup=(epoch < warmup_epoch), noisy=noisy, bg_masks_from_fg=False,
                                  forward_dyn=forward_dyn, train_enc_prior=train_enc_prior,
                                  num_static_frames=num_static_frames)
+            
             # calculate loss
             if epoch >= start_epoch:
                 discount = iteration / torch.tensor(max_iterations_per_step, device=x.device)
@@ -280,12 +289,14 @@ def train_ddlp(config_path='./configs/balls.json'):
             rec_x = model_output['rec']
             mu_scale = model_output['mu_scale']
             mu_depth = model_output['mu_depth']
+            
             # object stuff
             dec_objects_original = model_output['dec_objects_original']
             cropped_objects_original = model_output['cropped_objects_original']
             obj_on = model_output['obj_on']  # [batch_size, n_kp]
             alpha_masks = model_output['alpha_masks']  # [batch_size, n_kp, 1, h, w]
 
+            # gather losses
             psnr = all_losses['psnr']
             obj_on_l1 = all_losses['obj_on_l1']
             loss_kl = all_losses['kl']
@@ -299,9 +310,11 @@ def train_ddlp(config_path='./configs/balls.json'):
 
             x = x.view(-1, *x.shape[2:])
             x_prior = x_prior.view(-1, *x_prior.shape[2:])
+            
             # for plotting, confidence calculation
             mu_tot = z_base + mu_offset
             logvar_tot = logvar_offset
+            
             # log
             batch_psnrs.append(psnr.data.cpu().item())
             batch_losses.append(loss.data.cpu().item())
@@ -313,6 +326,7 @@ def train_ddlp(config_path='./configs/balls.json'):
             batch_losses_kl_scale.append(loss_kl_scale.data.cpu().item())
             batch_losses_kl_depth.append(loss_kl_depth.data.cpu().item())
             batch_losses_kl_obj_on.append(loss_kl_obj_on.data.cpu().item())
+            
             # progress bar
             if epoch < warmup_epoch:
                 pbar.set_description_str(f'epoch #{epoch} (warmup)')
@@ -323,8 +337,12 @@ def train_ddlp(config_path='./configs/balls.json'):
             pbar.set_postfix(loss=loss.data.cpu().item(), rec=loss_rec.data.cpu().item(),
                              kl=loss_kl.data.cpu().item(), on_l1=obj_on_l1.cpu().item(),
                              kl_dyn=loss_kl_dyn.data.cpu().item())
+            
             # break  # for debug
+        
         pbar.close()
+
+        # epoch-wise logging
         losses.append(np.mean(batch_losses))
         losses_rec.append(np.mean(batch_losses_rec))
         losses_kl.append(np.mean(batch_losses_kl))
@@ -336,6 +354,7 @@ def train_ddlp(config_path='./configs/balls.json'):
         losses_kl_obj_on.append(np.mean(batch_losses_kl_obj_on))
         if len(batch_psnrs) > 0:
             psnrs.append(np.mean(batch_psnrs))
+            
         # scheduler
         scheduler.step()
 
@@ -344,9 +363,7 @@ def train_ddlp(config_path='./configs/balls.json'):
         log_str += f'loss: {losses[-1]:.3f}, rec: {losses_rec[-1]:.3f}, kl: {losses_kl[-1]:.3f}\n'
         log_str += f'kl_balance: {kl_balance:.3f}, kl_kp: {losses_kl_kp[-1]:.3f}, kl_feat: {losses_kl_feat[-1]:.3f}\n'
         log_str += f'kl_scale: {losses_kl_scale[-1]:.3f}, kl_depth: {losses_kl_depth[-1]:.3f}, kl_obj_on: {losses_kl_obj_on[-1]:.3f}\n'
-
         log_str += f'kl_dyn: {losses_kl_dyn[-1]:.3f}\n'
-        # log_str += f'mu max: {mu.max()}, mu min: {mu.min()}\n'
         log_str += f'mu max: {mu_tot.max()}, mu min: {mu_tot.min()}\n'
         log_str += f'mu offset max: {mu_offset.max()}, mu offset min: {mu_offset.min()}\n'
         log_str += f'val loss (freq: {eval_epoch_freq}): {valid_loss:.3f},' \
@@ -361,14 +378,25 @@ def train_ddlp(config_path='./configs/balls.json'):
         print(log_str)
         log_line(log_dir, log_str)
 
+        # evaluation and plotting
         if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+            
             # for plotting purposes
             mu_plot = mu_tot.clamp(min=kp_range[0], max=kp_range[1])
             max_imgs = 8
-            img_with_kp = plot_keypoints_on_image_batch(mu_plot, x, radius=3,
-                                                        thickness=1, max_imgs=max_imgs, kp_range=kp_range)
-            img_with_kp_p = plot_keypoints_on_image_batch(mu_p, x_prior, radius=3, thickness=1, max_imgs=max_imgs,
-                                                          kp_range=kp_range)
+            
+            # plot keypoints for posterior and prior
+            img_with_kp = plot_keypoints_on_image_batch(
+                mu_plot, x, radius=3,
+                thickness=1, max_imgs=max_imgs, 
+                kp_range=kp_range
+            )
+            img_with_kp_p = plot_keypoints_on_image_batch(
+                mu_p, x_prior, radius=3, thickness=1, 
+                max_imgs=max_imgs,
+                kp_range=kp_range
+            )
+
             # top-k
             with torch.no_grad():
                 logvar_sum = logvar_tot.sum(-1) * obj_on  # [bs, n_kp]
@@ -380,37 +408,48 @@ def train_ddlp(config_path='./configs/balls.json'):
                 bb_scores = -1 * logvar_sum
                 hard_threshold = None
 
+            # plot bounding boxes using top-k keypoints and their corresponding scales, with NMS
             kp_batch = mu_plot
             scale_batch = mu_scale
-            img_with_masks_nms, nms_ind = plot_bb_on_image_batch_from_z_scale_nms(kp_batch, scale_batch, x,
-                                                                                  scores=bb_scores,
-                                                                                  iou_thresh=iou_thresh,
-                                                                                  thickness=1, max_imgs=max_imgs,
-                                                                                  hard_thresh=hard_threshold)
+            img_with_masks_nms, nms_ind = plot_bb_on_image_batch_from_z_scale_nms(
+                kp_batch, scale_batch, x,
+                scores=bb_scores,
+                iou_thresh=iou_thresh,
+                thickness=1, max_imgs=max_imgs,
+                hard_thresh=hard_threshold
+            )
             alpha_masks = torch.where(alpha_masks < 0.05, 0.0, 1.0)
-            img_with_masks_alpha_nms, _ = plot_bb_on_image_batch_from_masks_nms(alpha_masks, x, scores=bb_scores,
-                                                                                iou_thresh=iou_thresh, thickness=1,
-                                                                                max_imgs=max_imgs,
-                                                                                hard_thresh=hard_threshold)
+            img_with_masks_alpha_nms, _ = plot_bb_on_image_batch_from_masks_nms(
+                alpha_masks, x, scores=bb_scores,
+                iou_thresh=iou_thresh, thickness=1,
+                max_imgs=max_imgs,
+                hard_thresh=hard_threshold
+            )
+
             # hard_thresh: a general threshold for bb scores (set None to not use it)
             bb_str = f'bb scores: max: {bb_scores.max():.2f}, min: {bb_scores.min():.2f},' \
                      f' mean: {bb_scores.mean():.2f}\n'
             print(bb_str)
             log_line(log_dir, bb_str)
-            img_with_kp_topk = plot_keypoints_on_image_batch(topk_kp.clamp(min=kp_range[0], max=kp_range[1]), x,
-                                                             radius=3, thickness=1, max_imgs=max_imgs,
-                                                             kp_range=kp_range)
+            img_with_kp_topk = plot_keypoints_on_image_batch(
+                topk_kp.clamp(min=kp_range[0], max=kp_range[1]), x,
+                radius=3, thickness=1, max_imgs=max_imgs,
+                kp_range=kp_range
+            )
             dec_objects = model_output['dec_objects']
             bg = model_output['bg']
-            vutils.save_image(torch.cat([x[:max_imgs, -3:], img_with_kp[:max_imgs, -3:].to(device),
-                                         rec_x[:max_imgs, -3:], img_with_kp_p[:max_imgs, -3:].to(device),
-                                         img_with_kp_topk[:max_imgs, -3:].to(device),
-                                         dec_objects[:max_imgs, -3:],
-                                         img_with_masks_nms[:max_imgs, -3:].to(device),
-                                         img_with_masks_alpha_nms[:max_imgs, -3:].to(device),
-                                         bg[:max_imgs, -3:]],
-                                        dim=0).data.cpu(), '{}/image_{}.jpg'.format(fig_dir, epoch),
-                              nrow=8, pad_value=1)
+            vutils.save_image(torch.cat([
+                x[:max_imgs, -3:], img_with_kp[:max_imgs, -3:].to(device),
+                rec_x[:max_imgs, -3:], img_with_kp_p[:max_imgs, -3:].to(device),
+                img_with_kp_topk[:max_imgs, -3:].to(device),
+                dec_objects[:max_imgs, -3:],
+                img_with_masks_nms[:max_imgs, -3:].to(device),
+                img_with_masks_alpha_nms[:max_imgs, -3:].to(device),
+                bg[:max_imgs, -3:]
+                ], dim=0
+            ).data.cpu(), 
+            '{}/image_{}.jpg'.format(fig_dir, epoch), nrow=8, pad_value=1)
+
             with torch.no_grad():
                 _, dec_objects_rgb = torch.split(dec_objects_original, [1, 3], dim=2)
                 dec_objects_rgb = dec_objects_rgb.reshape(-1, *dec_objects_rgb.shape[2:])
@@ -494,9 +533,12 @@ def train_ddlp(config_path='./configs/balls.json'):
                     torch.save(checkpoint,
                                os.path.join(save_dir, f'{ds}_ddlp{run_prefix}_best_lpips.pth'))
                 torch.cuda.empty_cache()
+        
+        # collect validation losses
         valid_losses.append(valid_loss)
         if eval_im_metrics:
             val_lpipss.append(val_lpips)
+       
         # plot graphs
         if epoch > 0:
             num_plots = 4
@@ -523,6 +565,7 @@ def train_ddlp(config_path='./configs/balls.json'):
             plt.tight_layout()
             plt.savefig(f'{fig_dir}/{run_name}_graph.jpg')
             plt.close('all')
+    
     return model
 
 

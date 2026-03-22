@@ -271,9 +271,20 @@ if __name__ == '__main__':
         ckpt_path = checkpoint_path
     else:
         ckpt_path = os.path.join(dir_path, f'saves/{model_ckpt_name if use_last else model_best_ckpt_name}')
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    
+    # Load checkpoint with support for both old and new formats
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        # NEW FORMAT: Full checkpoint with optimizer and scheduler states
+        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint_epoch = checkpoint.get('epoch', 'unknown')
+        print(f"loaded model from {ckpt_path} (epoch {checkpoint_epoch})")
+    else:
+        # OLD FORMAT: Only model state_dict
+        model.load_state_dict(checkpoint)
+        print(f"loaded model from {ckpt_path} (old format)")
+    
     model.eval()
-    print(f"loaded model from {ckpt_path}")
 
     # create dir for results
     pred_dir = os.path.join(dir_path, 'eval')
