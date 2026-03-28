@@ -10,31 +10,39 @@ DEVICE="cuda:0"
 BATCH_SIZE=20
 LATENT_RECENTER_SOURCE="patch_alpha"
 LATENT_RECENTER_NMS_SOURCE="nominal"
+GHNN_DATASET_NAME="ddlp_extracted"
 # ----------------------------
 
-declare -A EVAL_SEQ_LEN_BY_MODE=(
-  [train]=60
-  [valid]=360
-)
+python3 "${SCRIPT}" \
+  --checkpoint "${CHECKPOINT}" \
+  --checkpoint_name "${CHECKPOINT_NAME}" \
+  --device "${DEVICE}" \
+  --batch_size "${BATCH_SIZE}" \
+  --mode train \
+  --convert_to_ghnn 1 \
+  --extraction_method latent \
+  --latent_position_variant recentered \
+  --latent_recenter_source "${LATENT_RECENTER_SOURCE}" \
+  --latent_recenter_nms_source "${LATENT_RECENTER_NMS_SOURCE}" \
+  --eval_seq_len 360 \
+  --ghnn_train_seq_len 60 \
+  --ghnn_dataset_name "${GHNN_DATASET_NAME}" \
+  --ghnn_step_size 1 \
+  --ghnn_dt 1
 
-COMMON_ARGS=(
-  --checkpoint "${CHECKPOINT}"
-  --checkpoint_name "${CHECKPOINT_NAME}"
-  --device "${DEVICE}"
-  --batch_size "${BATCH_SIZE}"
-  --max_batches all
-  --extraction_method latent
-  --latent_position_variant both
-  --latent_recenter_source "${LATENT_RECENTER_SOURCE}"
-  --latent_recenter_nms_source "${LATENT_RECENTER_NMS_SOURCE}"
-)
-
-for mode in train valid; do
-  python3 "${SCRIPT}" \
-    "${COMMON_ARGS[@]}" \
-    --mode "${mode}" \
-    --eval_seq_len "${EVAL_SEQ_LEN_BY_MODE[$mode]}" \
-    --visualize_trajectories 1 \
-    --extract_coordinates 0 \
-    --evaluate_latent_alignment 0
-done
+python3 "${SCRIPT}" \
+  --checkpoint "${CHECKPOINT}" \
+  --checkpoint_name "${CHECKPOINT_NAME}" \
+  --device "${DEVICE}" \
+  --batch_size "${BATCH_SIZE}" \
+  --mode valid \
+  --convert_to_ghnn 1 \
+  --extraction_method latent \
+  --latent_position_variant recentered \
+  --latent_recenter_source "${LATENT_RECENTER_SOURCE}" \
+  --latent_recenter_nms_source "${LATENT_RECENTER_NMS_SOURCE}" \
+  --eval_seq_len 360 \
+  --ghnn_train_seq_len 60 \
+  --ghnn_dataset_name "${GHNN_DATASET_NAME}" \
+  --ghnn_step_size 1 \
+  --ghnn_dt 1
