@@ -34,7 +34,8 @@ if parent_dir not in sys.path:
 
 # torch
 import torch
-from torch.utils.data import DataLoader
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
 # datasets
 from datasets.get_dataset import get_video_dataset
@@ -428,14 +429,19 @@ def _create_trajectory_video(
 def reorder_predictions(
     pred_coords, 
     method='smallest_consecutive_distance',
-    print_debug=False
+    print_debug=False,
+    return_permutations=False,
 ):
     
     reordered_predictions = []
+    applied_permutations = []
     for b in range(pred_coords.shape[0]):
         pred_seq = pred_coords[b]  # (T, N_pred, 2)
         
         re_ordered_seq = pred_seq.clone()  # Initialize with original order
+        permutation_seq = []
+        identity_perm = np.arange(pred_seq.shape[1], dtype=np.int64)
+        permutation_seq.append(identity_perm.copy())
 
         if method == 'smallest_consecutive_distance':
             # For 2-body systems: track first particle, second is automatically tracked
@@ -451,8 +457,13 @@ def reorder_predictions(
                 if closest_idx != 0:
                     # Swap the closest particle with the first one
                     re_ordered_seq[t, [0, closest_idx]] = pred_seq[t, [closest_idx, 0]]
+                    perm_t = identity_perm.copy()
+                    perm_t[[0, closest_idx]] = perm_t[[closest_idx, 0]]
+                else:
+                    perm_t = identity_perm.copy()
 
                 to_compare = re_ordered_seq[t, 0]  # Update to the newly assigned first particle for next comparison
+                permutation_seq.append(perm_t)
         
         elif method == 'hungarian':
             # For N>2 systems: use Hungarian algorithm for optimal matching
@@ -472,6 +483,7 @@ def reorder_predictions(
                 
                 # Apply the permutation to current timestep
                 re_ordered_seq[t] = curr_positions[col_ind]
+                permutation_seq.append(np.asarray(col_ind, dtype=np.int64))
 
         else:
             raise ValueError(f"Unknown re-ordering method: {method}. Available methods: 'smallest_consecutive_distance' (for N=2), 'hungarian' (for N>2).")
@@ -484,11 +496,409 @@ def reorder_predictions(
             print()
 
         reordered_predictions.append(re_ordered_seq.cpu().numpy())
+        applied_permutations.append(np.stack(permutation_seq, axis=0))
 
+    if return_permutations:
+        return reordered_predictions, applied_permutations
     return reordered_predictions
 #####################################################################################
 
 #####################################################################################
+def _apply_temporal_permutation(array_like, permutation_seq):
+    arr = np.asarray(array_like)
+    perms = np.asarray(permutation_seq, dtype=np.int64)
+    if arr.ndim < 2:
+        raise ValueError(f"Expected arr.ndim >= 2 for temporal permutation, got shape={arr.shape}")
+    if perms.ndim != 2:
+        raise ValueError(f"Expected permutation_seq ndim=2 [T,N], got shape={perms.shape}")
+    if arr.shape[0] != perms.shape[0] or arr.shape[1] != perms.shape[1]:
+        raise ValueError(
+            f"Temporal permutation shape mismatch: arr.shape={arr.shape}, permutation_seq.shape={perms.shape}"
+        )
+    reordered = np.empty_like(arr)
+    for t in range(arr.shape[0]):
+        reordered[t] = arr[t, perms[t], ...]
+    return reordered
+
+
+def _pearson_1d_np(a, b, eps=1e-8):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = np.sqrt(np.sum(a * a) * np.sum(b * b)) + eps
+    if denom <= eps:
+        return 0.0
+    return float(np.sum(a * b) / denom)
+
+
+def _build_alignment_cost_matrix(P, G, eps=1e-8):
+    if P.shape != G.shape:
+        raise ValueError(f"Expected matching shapes, got P={P.shape}, G={G.shape}")
+    _, N, D = P.shape
+    if D != 2:
+        raise ValueError(f"Expected last dim D=2, got D={D}")
+    cost = np.zeros((N, N), dtype=np.float64)
+    for i in range(N):
+        px = P[:, i, 0]
+        py = P[:, i, 1]
+        for j in range(N):
+            gx = G[:, j, 0]
+            gy = G[:, j, 1]
+            rx = _pearson_1d_np(px, gx, eps=eps)
+            ry = _pearson_1d_np(py, gy, eps=eps)
+            sim = 0.5 * (rx + ry)
+            cost[i, j] = 1.0 - sim
+    return cost
+
+
+def _hungarian_perm_pred_for_gt(P, G, eps=1e-8):
+    cost = _build_alignment_cost_matrix(P, G, eps=eps)
+    row_ind, col_ind = linear_sum_assignment(cost)
+    perm_pred_for_gt = np.empty(P.shape[1], dtype=np.int64)
+    for pred_i, gt_j in zip(row_ind, col_ind):
+        perm_pred_for_gt[gt_j] = pred_i
+    return perm_pred_for_gt
+
+
+def _compute_prediction_metrics(pred_coordinates, gt_coordinates_, eps=1e-8):
+    pred_coordinates = np.asarray(pred_coordinates, dtype=np.float64)
+    gt_coordinates_ = np.asarray(gt_coordinates_, dtype=np.float64)
+    if pred_coordinates.shape != gt_coordinates_.shape:
+        raise ValueError(
+            f"Shape mismatch pred {pred_coordinates.shape} vs gt {gt_coordinates_.shape}. "
+            "Expected both to be [V, T, N, 2]."
+        )
+
+    V, T, N, D = pred_coordinates.shape
+    if D != 2:
+        raise ValueError(f"Expected last dimension D=2, got D={D}.")
+
+    def _rmse(A, B):
+        return float(np.sqrt(np.mean((A - B) ** 2)))
+
+    def _r2_score(y_true, y_pred):
+        y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+        y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+        sse = np.sum((y_true - y_pred) ** 2)
+        sst = np.sum((y_true - y_true.mean()) ** 2) + eps
+        return float(1.0 - sse / sst)
+
+    def _mean_std(xs):
+        xs = np.asarray(xs, dtype=np.float64)
+        return float(xs.mean()), float(xs.std())
+
+    per_video_mean_pearson = []
+    per_video_mean_pearson_vel = []
+    per_video_rmse = []
+    per_video_nrmse_bbox = []
+    per_video_nrmse_std = []
+    per_video_r2 = []
+
+    for v in range(V):
+        pred_v = pred_coordinates[v]
+        gt_v = gt_coordinates_[v]
+
+        rs = []
+        for n in range(N):
+            rs.append(_pearson_1d_np(pred_v[:, n, 0], gt_v[:, n, 0], eps=eps))
+            rs.append(_pearson_1d_np(pred_v[:, n, 1], gt_v[:, n, 1], eps=eps))
+        per_video_mean_pearson.append(float(np.mean(rs)) if len(rs) > 0 else 0.0)
+
+        if T >= 2:
+            d_pred = np.diff(pred_v, axis=0)
+            d_gt = np.diff(gt_v, axis=0)
+            rvs = []
+            for n in range(N):
+                rvs.append(_pearson_1d_np(d_pred[:, n, 0], d_gt[:, n, 0], eps=eps))
+                rvs.append(_pearson_1d_np(d_pred[:, n, 1], d_gt[:, n, 1], eps=eps))
+            per_video_mean_pearson_vel.append(float(np.mean(rvs)) if len(rvs) > 0 else 0.0)
+        else:
+            per_video_mean_pearson_vel.append(0.0)
+
+        rmse_v = _rmse(pred_v, gt_v)
+        per_video_rmse.append(rmse_v)
+
+        gt_flat = gt_v.reshape(-1, 2)
+        bbox_diag_v = float(np.linalg.norm(gt_flat.max(axis=0) - gt_flat.min(axis=0)))
+        std_v = float(gt_v.reshape(-1).std())
+
+        per_video_nrmse_bbox.append(rmse_v / (bbox_diag_v + eps))
+        per_video_nrmse_std.append(rmse_v / (std_v + eps))
+        per_video_r2.append(_r2_score(gt_v, pred_v))
+
+    mean_r, std_r = _mean_std(per_video_mean_pearson)
+    mean_rv, std_rv = _mean_std(per_video_mean_pearson_vel)
+    mean_rmse, std_rmse = _mean_std(per_video_rmse)
+    mean_nrmse_bbox, std_nrmse_bbox = _mean_std(per_video_nrmse_bbox)
+    mean_nrmse_std, std_nrmse_std = _mean_std(per_video_nrmse_std)
+    mean_r2, std_r2 = _mean_std(per_video_r2)
+
+    return {
+        "mean_pearson_pos_mean": mean_r,
+        "mean_pearson_pos_std": std_r,
+        "mean_pearson_vel_mean": mean_rv,
+        "mean_pearson_vel_std": std_rv,
+        "rmse_mean": mean_rmse,
+        "rmse_std": std_rmse,
+        "nrmse_bbox_mean": mean_nrmse_bbox,
+        "nrmse_bbox_std": std_nrmse_bbox,
+        "nrmse_std_mean": mean_nrmse_std,
+        "nrmse_std_std": std_nrmse_std,
+        "r2_mean": mean_r2,
+        "r2_std": std_r2,
+    }
+
+
+def _set_random_seed(seed):
+    seed = int(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+class NonlinearProbeMLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, num_hidden_layers=2, output_dim=2):
+        super().__init__()
+        layers = []
+        in_dim = int(input_dim)
+        hidden_dim = int(hidden_dim)
+        num_hidden_layers = int(num_hidden_layers)
+        if num_hidden_layers < 1:
+            raise ValueError(f"num_hidden_layers must be >= 1, got {num_hidden_layers}")
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU(True))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, int(output_dim)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def _fit_nonlinear_probe(
+    train_inputs,
+    train_targets,
+    device,
+    hidden_dim=64,
+    num_hidden_layers=2,
+    epochs=25,
+    batch_size=4096,
+    lr=1e-3,
+    weight_decay=1e-6,
+    seed=0,
+):
+    train_inputs = np.asarray(train_inputs, dtype=np.float32)
+    train_targets = np.asarray(train_targets, dtype=np.float32)
+    epochs = int(epochs)
+    if train_inputs.ndim != 2:
+        raise ValueError(f"Expected train_inputs ndim=2 [M,D], got shape={train_inputs.shape}")
+    if train_targets.ndim != 2 or train_targets.shape[1] != 2:
+        raise ValueError(f"Expected train_targets shape [M,2], got {train_targets.shape}")
+    if train_inputs.shape[0] != train_targets.shape[0]:
+        raise ValueError(
+            f"Input/target sample mismatch: {train_inputs.shape[0]} vs {train_targets.shape[0]}"
+        )
+    if train_inputs.shape[0] == 0:
+        raise ValueError("Cannot fit nonlinear probe with zero training samples.")
+    if epochs < 1:
+        raise ValueError(f"nonlinear probe epochs must be >= 1, got {epochs}.")
+
+    _set_random_seed(seed)
+    device = torch.device(device)
+
+    x_cpu = torch.from_numpy(train_inputs)
+    y_cpu = torch.from_numpy(train_targets)
+    x_mean = x_cpu.mean(dim=0)
+    x_std = x_cpu.std(dim=0, unbiased=False).clamp_min(1e-6)
+    y_mean = y_cpu.mean(dim=0)
+    y_std = y_cpu.std(dim=0, unbiased=False).clamp_min(1e-6)
+
+    dataset = TensorDataset((x_cpu - x_mean) / x_std, (y_cpu - y_mean) / y_std)
+    effective_batch_size = min(int(batch_size), len(dataset))
+    if effective_batch_size <= 0:
+        effective_batch_size = len(dataset)
+    generator = torch.Generator().manual_seed(int(seed))
+    loader = DataLoader(
+        dataset,
+        batch_size=effective_batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=generator,
+    )
+
+    model = NonlinearProbeMLP(
+        input_dim=train_inputs.shape[1],
+        hidden_dim=hidden_dim,
+        num_hidden_layers=num_hidden_layers,
+        output_dim=2,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    criterion = nn.MSELoss()
+
+    loss_history = []
+    for epoch_idx in range(epochs):
+        model.train()
+        running_loss = 0.0
+        sample_count = 0
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            optimizer.step()
+            batch_size_curr = xb.shape[0]
+            running_loss += float(loss.detach().cpu().item()) * batch_size_curr
+            sample_count += batch_size_curr
+
+        epoch_loss = running_loss / max(sample_count, 1)
+        loss_history.append(epoch_loss)
+
+    num_parameters = int(sum(p.numel() for p in model.parameters()))
+    return {
+        "model": model,
+        "x_mean": x_mean.to(device),
+        "x_std": x_std.to(device),
+        "y_mean": y_mean.to(device),
+        "y_std": y_std.to(device),
+        "training_history": {
+            "loss": [float(v) for v in loss_history],
+            "final_loss": float(loss_history[-1]),
+        },
+        "num_parameters": num_parameters,
+        "config": {
+            "hidden_dim": int(hidden_dim),
+            "num_hidden_layers": int(num_hidden_layers),
+            "epochs": epochs,
+            "batch_size": int(effective_batch_size),
+            "lr": float(lr),
+            "weight_decay": float(weight_decay),
+            "seed": int(seed),
+        },
+    }
+
+
+def _predict_with_nonlinear_probe(probe_bundle, inputs):
+    inputs = np.asarray(inputs, dtype=np.float32)
+    if inputs.ndim != 2:
+        raise ValueError(f"Expected inputs ndim=2 [M,D], got shape={inputs.shape}")
+
+    model = probe_bundle["model"]
+    device = next(model.parameters()).device
+    x_mean = probe_bundle["x_mean"]
+    x_std = probe_bundle["x_std"]
+    y_mean = probe_bundle["y_mean"]
+    y_std = probe_bundle["y_std"]
+
+    with torch.no_grad():
+        x = torch.from_numpy(inputs).to(device)
+        pred_norm = model((x - x_mean) / x_std)
+        pred = pred_norm * y_std + y_mean
+    return pred.detach().cpu().numpy()
+
+
+def _build_nonlinear_probe_feature_tensor(variant_payload, probe_name):
+    if probe_name == "p_only":
+        return np.asarray(variant_payload["p"], dtype=np.float32)
+    if probe_name == "p_s":
+        return np.concatenate(
+            [
+                np.asarray(variant_payload["p"], dtype=np.float32),
+                np.asarray(variant_payload["s"], dtype=np.float32),
+            ],
+            axis=-1,
+        )
+    if probe_name == "p_s_d_t":
+        return np.concatenate(
+            [
+                np.asarray(variant_payload["p"], dtype=np.float32),
+                np.asarray(variant_payload["s"], dtype=np.float32),
+                np.asarray(variant_payload["d"], dtype=np.float32),
+                np.asarray(variant_payload["tau"], dtype=np.float32),
+            ],
+            axis=-1,
+        )
+    raise ValueError(f"Unknown nonlinear probe '{probe_name}'")
+
+
+def _truncate_nonlinear_probe_split_payload(split_payload, seq_len):
+    seq_len = int(seq_len)
+    out = {
+        "mode": split_payload["mode"],
+        "matching": split_payload.get("matching", "index_to_index"),
+        "source_seq_len": int(split_payload["gt"].shape[1]),
+        "eval_seq_len": seq_len,
+    }
+    for variant_name in ["nominal", "recentered"]:
+        if variant_name not in split_payload:
+            continue
+        variant_payload = split_payload[variant_name]
+        out[variant_name] = {
+            "p": variant_payload["p"][:, :seq_len].copy(),
+            "s": variant_payload["s"][:, :seq_len].copy(),
+            "d": variant_payload["d"][:, :seq_len].copy(),
+            "tau": variant_payload["tau"][:, :seq_len].copy(),
+            "gt": variant_payload["gt"][:, :seq_len].copy(),
+        }
+    out["gt"] = split_payload["gt"][:, :seq_len].copy()
+    return out
+
+
+def _apply_supervised_matching_to_variant_payload(variant_payload):
+    gt = np.asarray(variant_payload["gt"], dtype=np.float32)
+    p = np.asarray(variant_payload["p"], dtype=np.float32)
+    s = np.asarray(variant_payload["s"], dtype=np.float32)
+    d = np.asarray(variant_payload["d"], dtype=np.float32)
+    tau = np.asarray(variant_payload["tau"], dtype=np.float32)
+
+    V = gt.shape[0]
+    p_matched = np.empty_like(p)
+    s_matched = np.empty_like(s)
+    d_matched = np.empty_like(d)
+    tau_matched = np.empty_like(tau)
+    permutations = []
+
+    for v in range(V):
+        perm = _hungarian_perm_pred_for_gt(p[v], gt[v])
+        permutations.append(perm.tolist())
+        p_matched[v] = p[v][:, perm, :]
+        s_matched[v] = s[v][:, perm, :]
+        d_matched[v] = d[v][:, perm, :]
+        tau_matched[v] = tau[v][:, perm, :]
+
+    return {
+        "p": p_matched,
+        "s": s_matched,
+        "d": d_matched,
+        "tau": tau_matched,
+        "gt": gt.copy(),
+        "supervised_matching_permutations": permutations,
+    }
+
+
+def _evaluate_nonlinear_probe_on_split(probe_bundle, variant_payload, probe_name):
+    features = _build_nonlinear_probe_feature_tensor(variant_payload, probe_name)
+    gt = np.asarray(variant_payload["gt"], dtype=np.float32)
+    pred = _predict_with_nonlinear_probe(
+        probe_bundle,
+        features.reshape(-1, features.shape[-1]),
+    ).reshape(gt.shape)
+    metrics = _compute_prediction_metrics(pred, gt)
+    metrics.update(
+        {
+            "num_videos": int(gt.shape[0]),
+            "T": int(gt.shape[1]),
+            "N": int(gt.shape[2]),
+            "num_samples": int(np.prod(gt.shape[:3])),
+        }
+    )
+    return metrics
+
+
 def evaluate_latent_alignment_metrics(
     pred_coordinates, 
     gt_coordinates_, 
@@ -1314,6 +1724,8 @@ def video_to_trajectory(
     latent_recenter_source='patch_alpha',
     latent_recenter_nms_source='nominal',
     latent_recenter_eps=1e-6,
+    collect_nonlinear_probe_inputs=False,
+    return_nonlinear_probe_payload=False,
 ):
     """
     Collect video data for visualization purposes.
@@ -1355,6 +1767,10 @@ def video_to_trajectory(
         latent_recenter_nms_source: Which latent coordinates drive NMS/filtering in latent mode:
             'nominal' or 'recentered'.
         latent_recenter_eps: Numerical epsilon for centroid computation stability.
+        collect_nonlinear_probe_inputs: If True, also collect re-ordered latent
+            position/scale/depth/transparency tensors for nonlinear probe fitting.
+        return_nonlinear_probe_payload: If True, return the structured nonlinear
+            probe payload instead of the standard coordinate array.
 
     returns:
         If extract_coordinates=True, returns a numpy array of shape [V, T, N, 2] containing predicted coordinates for all videos in the evaluated set. Otherwise, returns None.
@@ -1387,6 +1803,10 @@ def video_to_trajectory(
     latent_recenter_eps = float(latent_recenter_eps)
     if latent_recenter_eps <= 0.0:
         raise ValueError(f"latent_recenter_eps must be > 0, got {latent_recenter_eps}")
+    if return_nonlinear_probe_payload and not collect_nonlinear_probe_inputs:
+        raise ValueError(
+            "return_nonlinear_probe_payload=True requires collect_nonlinear_probe_inputs=True."
+        )
 
     if extraction_method != 'latent':
         if latent_position_variant != 'nominal' or latent_recenter_nms_source != 'nominal' or latent_recenter_source != 'patch_alpha':
@@ -1419,11 +1839,23 @@ def video_to_trajectory(
     # assert method arguments compatibility
     if evaluate_latent_alignment and not extract_coordinates:
         raise ValueError("evaluate_latent_alignment=True requires extract_coordinates=True to access predicted coordinates for alignment evaluation.")
+    if collect_nonlinear_probe_inputs and extraction_method != 'latent':
+        raise ValueError("collect_nonlinear_probe_inputs=True is supported only for extraction_method='latent'.")
+    if collect_nonlinear_probe_inputs and not extract_coordinates:
+        raise ValueError(
+            "collect_nonlinear_probe_inputs=True requires extract_coordinates=True so the same "
+            "re-ordered latent trajectories can be reused for nonlinear probe fitting."
+        )
     if returns and not extract_coordinates:
         raise ValueError("returns=True requires extract_coordinates=True to return predicted coordinates.")
     if returns and evaluate_latent_alignment:
         raise ValueError("returns=True is not compatible with evaluate_latent_alignment=True " \
                          "since the latter already returns metrics. Set returns=False when evaluate_latent_alignment=True.")
+    if returns and return_nonlinear_probe_payload:
+        raise ValueError(
+            "returns=True is not compatible with return_nonlinear_probe_payload=True. "
+            "Use the structured nonlinear payload return instead."
+        )
     if returns and eval_seq_len is None:
         raise ValueError("returns=True requires eval_seq_len to be specified to ensure consistent output shape." \
                          "Set eval_seq_len to an integer value.")
@@ -1454,7 +1886,9 @@ def video_to_trajectory(
     if noisy_gt_noise_alphas is None:
         noisy_gt_noise_alphas = [0.05, 0.1, 0.3, 0.5, 0.7]
     noisy_gt_noise_alphas = [float(a) for a in noisy_gt_noise_alphas]
-    needs_alignment_targets = bool(evaluate_latent_alignment or evaluate_noisy_gt_reference)
+    needs_alignment_targets = bool(
+        evaluate_latent_alignment or evaluate_noisy_gt_reference or collect_nonlinear_probe_inputs
+    )
 
     # Load useful config parameters 
     ds = config['ds']
@@ -1563,6 +1997,8 @@ def video_to_trajectory(
     all_coordinates_recentered = []  # secondary coordinates for latent_position_variant='both'
     gt_coordinates = []  # To store ground-truth coordinates for latent alignment evaluation
     all_frame_mse_per_video = []  # frame-wise reconstruction MSE, list of [T]
+    nonlinear_probe_nominal = {"p": [], "s": [], "d": [], "tau": []}
+    nonlinear_probe_recentered = {"p": [], "s": [], "d": [], "tau": []}
     recenter_shift_l2_means = []  # mean ||p_can - p|| over kept trajectories
     recenter_valid_fractions = []  # fraction of valid alpha-mass centroids over kept trajectories
     max_failed_videos_to_plot = 10
@@ -1850,6 +2286,9 @@ def video_to_trajectory(
             batch_coordinates = []
             batch_coordinates_recentered = []
             batch_gt_coordinates = []
+            batch_latent_scale_raw = []
+            batch_latent_depth_raw = []
+            batch_latent_tau_raw = []
             
             # ========================================================================
             # EXTRACTION METHOD BRANCHING: bbox vs latent
@@ -2016,6 +2455,14 @@ def video_to_trajectory(
                             first_faulty_t=None,
                         )
                         continue
+
+                    if collect_nonlinear_probe_inputs:
+                        latent_scale = mu_scale[video_idx, :, filtered_indices, :].cpu().numpy()
+                        latent_depth = z_depth[video_idx, :, filtered_indices, :].cpu().numpy()
+                        latent_tau = obj_on[video_idx, :, filtered_indices].unsqueeze(-1).cpu().numpy()
+                        batch_latent_scale_raw.append(latent_scale)
+                        batch_latent_depth_raw.append(latent_depth)
+                        batch_latent_tau_raw.append(latent_tau)
 
                     batch_coordinates.append(latent_positions)  # [T, K, 2] in kp_range
                     if latent_position_variant == 'both':
@@ -2195,21 +2642,33 @@ def video_to_trajectory(
             ] # list np array
 
             # then reorder the batch of coordinates using the defined re-ordering function (e.g., smallest_consecutive_distance)
-            reordered_batch_coordinates = reorder_predictions(
+            reordered_batch_coordinates_result = reorder_predictions(
                 torch.stack([torch.from_numpy(c) if isinstance(c, np.ndarray) else c 
                             for c in batch_coordinates], dim=0), 
                 method=reorder_method, 
-                print_debug=False
-            ) # list of np arrays
+                print_debug=False,
+                return_permutations=collect_nonlinear_probe_inputs,
+            )
+            if collect_nonlinear_probe_inputs:
+                reordered_batch_coordinates, reordered_batch_permutations = reordered_batch_coordinates_result
+            else:
+                reordered_batch_coordinates = reordered_batch_coordinates_result
+                reordered_batch_permutations = None
 
             reordered_batch_coordinates_recentered = None
+            reordered_batch_permutations_recentered = None
             if extraction_method == 'latent' and latent_position_variant == 'both':
-                reordered_batch_coordinates_recentered = reorder_predictions(
+                reordered_batch_coordinates_recentered_result = reorder_predictions(
                     torch.stack([torch.from_numpy(c) if isinstance(c, np.ndarray) else c
                                 for c in batch_coordinates_recentered], dim=0),
                     method=reorder_method,
-                    print_debug=False
+                    print_debug=False,
+                    return_permutations=collect_nonlinear_probe_inputs,
                 )
+                if collect_nonlinear_probe_inputs:
+                    reordered_batch_coordinates_recentered, reordered_batch_permutations_recentered = reordered_batch_coordinates_recentered_result
+                else:
+                    reordered_batch_coordinates_recentered = reordered_batch_coordinates_recentered_result
             
             # ========================================================================
             # SMOOTHING: Only apply for bbox extraction
@@ -2240,6 +2699,74 @@ def video_to_trajectory(
                 elif extraction_method == 'latent' and latent_position_variant == 'both':
                     batch_reordered_coordinates_recentered = np.stack(reordered_batch_coordinates_recentered, axis=0)
                     all_coordinates_recentered.append(batch_reordered_coordinates_recentered)
+
+            if collect_nonlinear_probe_inputs:
+                if reordered_batch_permutations is None:
+                    raise RuntimeError(
+                        "collect_nonlinear_probe_inputs=True expected reordered_batch_permutations, found None."
+                    )
+                nonlinear_probe_nominal["p"].append(np.stack(reordered_batch_coordinates, axis=0))
+                nonlinear_probe_nominal["s"].append(
+                    np.stack(
+                        [
+                            _apply_temporal_permutation(batch_latent_scale_raw[i], reordered_batch_permutations[i])
+                            for i in range(len(batch_latent_scale_raw))
+                        ],
+                        axis=0,
+                    )
+                )
+                nonlinear_probe_nominal["d"].append(
+                    np.stack(
+                        [
+                            _apply_temporal_permutation(batch_latent_depth_raw[i], reordered_batch_permutations[i])
+                            for i in range(len(batch_latent_depth_raw))
+                        ],
+                        axis=0,
+                    )
+                )
+                nonlinear_probe_nominal["tau"].append(
+                    np.stack(
+                        [
+                            _apply_temporal_permutation(batch_latent_tau_raw[i], reordered_batch_permutations[i])
+                            for i in range(len(batch_latent_tau_raw))
+                        ],
+                        axis=0,
+                    )
+                )
+
+                if extraction_method == 'latent' and latent_position_variant == 'both':
+                    if reordered_batch_coordinates_recentered is None or reordered_batch_permutations_recentered is None:
+                        raise RuntimeError(
+                            "Expected recentered trajectories and permutations for nonlinear probe collection."
+                        )
+                    nonlinear_probe_recentered["p"].append(np.stack(reordered_batch_coordinates_recentered, axis=0))
+                    nonlinear_probe_recentered["s"].append(
+                        np.stack(
+                            [
+                                _apply_temporal_permutation(batch_latent_scale_raw[i], reordered_batch_permutations_recentered[i])
+                                for i in range(len(batch_latent_scale_raw))
+                            ],
+                            axis=0,
+                        )
+                    )
+                    nonlinear_probe_recentered["d"].append(
+                        np.stack(
+                            [
+                                _apply_temporal_permutation(batch_latent_depth_raw[i], reordered_batch_permutations_recentered[i])
+                                for i in range(len(batch_latent_depth_raw))
+                            ],
+                            axis=0,
+                        )
+                    )
+                    nonlinear_probe_recentered["tau"].append(
+                        np.stack(
+                            [
+                                _apply_temporal_permutation(batch_latent_tau_raw[i], reordered_batch_permutations_recentered[i])
+                                for i in range(len(batch_latent_tau_raw))
+                            ],
+                            axis=0,
+                        )
+                    )
 
             # if evaluating latent alignment, also store the ground-truth coordinates for this batch for later comparison with predicted coordinates in latent space
             if needs_alignment_targets:
@@ -2357,6 +2884,7 @@ def video_to_trajectory(
 
     # After processing all batches, concatenate all_coordinates 
     all_coordinates_recentered_agg = None
+    nonlinear_probe_payload = None
     if extract_coordinates:
         if len(all_coordinates) == 0:
             raise ValueError(
@@ -2376,6 +2904,35 @@ def video_to_trajectory(
                     )
                 all_coordinates_recentered_agg = np.concatenate(all_coordinates_recentered, axis=0)
 
+        if collect_nonlinear_probe_inputs:
+            if len(nonlinear_probe_nominal["p"]) == 0:
+                raise ValueError(
+                    f"No nonlinear probe payload could be collected for mode={mode}. "
+                    "All trajectories were filtered out."
+                )
+            nonlinear_probe_payload = {
+                "mode": mode,
+                "matching": "index_to_index",
+                "nominal": {
+                    "p": np.concatenate(nonlinear_probe_nominal["p"], axis=0),
+                    "s": np.concatenate(nonlinear_probe_nominal["s"], axis=0),
+                    "d": np.concatenate(nonlinear_probe_nominal["d"], axis=0),
+                    "tau": np.concatenate(nonlinear_probe_nominal["tau"], axis=0),
+                },
+            }
+            if latent_position_variant == 'both':
+                if len(nonlinear_probe_recentered["p"]) == 0:
+                    raise ValueError(
+                        "latent_position_variant='both' requested nonlinear probe collection but "
+                        "no recentered payload was aggregated."
+                    )
+                nonlinear_probe_payload["recentered"] = {
+                    "p": np.concatenate(nonlinear_probe_recentered["p"], axis=0),
+                    "s": np.concatenate(nonlinear_probe_recentered["s"], axis=0),
+                    "d": np.concatenate(nonlinear_probe_recentered["d"], axis=0),
+                    "tau": np.concatenate(nonlinear_probe_recentered["tau"], axis=0),
+                }
+
         if returns:
             if extraction_method == 'latent' and latent_position_variant == 'both':
                 print(
@@ -2393,6 +2950,17 @@ def video_to_trajectory(
                 f"(mode={mode}). All trajectories were filtered out."
             )
         gt_coordinates_ = np.concatenate(gt_coordinates, axis=0)  # [total_videos, T, n_kp, 2]
+
+    if return_nonlinear_probe_payload:
+        if nonlinear_probe_payload is None or gt_coordinates_ is None:
+            raise RuntimeError(
+                "return_nonlinear_probe_payload=True expected nonlinear_probe_payload and gt_coordinates_."
+            )
+        nonlinear_probe_payload["gt"] = gt_coordinates_
+        nonlinear_probe_payload["nominal"]["gt"] = gt_coordinates_
+        if "recentered" in nonlinear_probe_payload:
+            nonlinear_probe_payload["recentered"]["gt"] = gt_coordinates_
+        return nonlinear_probe_payload
 
     if evaluate_latent_alignment:
         skip_mse_plot = latent_position_variant == 'both'
@@ -2563,6 +3131,227 @@ def video_to_trajectory(
             noise_alphas=noisy_gt_noise_alphas,
             noise_seed=noisy_gt_noise_seed,
         )
+#####################################################################################
+
+#####################################################################################
+def evaluate_latent_alignment_nonlinear_joint(
+    model,
+    config,
+    device=torch.device('cpu'),
+    batch_size=32,
+    max_batches=None,
+    save_dir=None,
+    latent_eval_save_dir=None,
+    use_hungarian_for_correlation=False,
+    reorder_method='smallest_consecutive_distance',
+    extraction_method='latent',
+    latent_position_variant='both',
+    latent_recenter_source='patch_alpha',
+    latent_recenter_nms_source='nominal',
+    latent_recenter_eps=1e-6,
+    train_seq_len=60,
+    valid_seq_len=360,
+    probe_hidden_dim=64,
+    probe_num_hidden_layers=2,
+    probe_epochs=25,
+    probe_batch_size=4096,
+    probe_lr=1e-3,
+    probe_weight_decay=1e-6,
+    probe_seed=0,
+):
+    if extraction_method != 'latent':
+        raise ValueError("Nonlinear latent-alignment probe requires extraction_method='latent'.")
+    if latent_position_variant != 'both':
+        raise ValueError("Nonlinear latent-alignment probe requires latent_position_variant='both'.")
+    if reorder_method != 'smallest_consecutive_distance':
+        raise ValueError(
+            "Nonlinear latent-alignment probe requires reorder_method='smallest_consecutive_distance'."
+        )
+
+    if latent_eval_save_dir is None:
+        latent_eval_save_dir = save_dir
+    if latent_eval_save_dir is None:
+        raise ValueError("A save directory is required for nonlinear latent-alignment evaluation.")
+    os.makedirs(latent_eval_save_dir, exist_ok=True)
+
+    print("\n" + "=" * 80)
+    print("NONLINEAR LATENT ALIGNMENT EVALUATION")
+    print("=" * 80)
+    print("Fitting MLP probes on TRAIN and evaluating on TRAIN + VALID")
+    print(f"Train extraction seq_len: {int(train_seq_len)}")
+    print(f"Valid extraction seq_len before truncation: {int(valid_seq_len)}")
+    print(f"Valid evaluation seq_len after truncation: {int(train_seq_len)}")
+    print(f"Supervised Hungarian matching: {'ON' if use_hungarian_for_correlation else 'OFF'}")
+    print("=" * 80)
+
+    common_kwargs = dict(
+        model=model,
+        config=config,
+        device=device,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        save_dir=None,
+        latent_eval_save_dir=None,
+        visualize_trajectories=False,
+        extract_coordinates=True,
+        returns=False,
+        evaluate_latent_alignment=False,
+        evaluate_noisy_gt_reference=False,
+        use_hungarian_for_correlation=use_hungarian_for_correlation,
+        reorder_method=reorder_method,
+        sg_window_length=15,
+        sg_polyorder=2,
+        extraction_method=extraction_method,
+        filtering_report_path=None,
+        latent_position_variant=latent_position_variant,
+        latent_recenter_source=latent_recenter_source,
+        latent_recenter_nms_source=latent_recenter_nms_source,
+        latent_recenter_eps=latent_recenter_eps,
+        collect_nonlinear_probe_inputs=True,
+        return_nonlinear_probe_payload=True,
+    )
+
+    train_payload = video_to_trajectory(
+        mode='train',
+        eval_seq_len=int(train_seq_len),
+        **common_kwargs,
+    )
+    valid_payload = video_to_trajectory(
+        mode='valid',
+        eval_seq_len=int(valid_seq_len),
+        **common_kwargs,
+    )
+
+    train_num_objects = int(train_payload["gt"].shape[2])
+    valid_num_objects = int(valid_payload["gt"].shape[2])
+    if train_num_objects != valid_num_objects:
+        raise ValueError(
+            f"Train/valid object-count mismatch for nonlinear probe evaluation: "
+            f"train N={train_num_objects}, valid N={valid_num_objects}."
+        )
+    if train_num_objects != 2:
+        raise ValueError(
+            "Nonlinear latent-alignment probe currently supports exactly 2 objects because "
+            "it relies on reorder_method='smallest_consecutive_distance'. "
+            f"Got N={train_num_objects}."
+        )
+
+    train_eval_seq_len = int(train_payload["gt"].shape[1])
+    valid_source_seq_len = int(valid_payload["gt"].shape[1])
+    if valid_source_seq_len < train_eval_seq_len:
+        raise ValueError(
+            f"Valid split length ({valid_source_seq_len}) is shorter than train probe length "
+            f"({train_eval_seq_len}); cannot truncate valid to match train."
+        )
+    valid_payload = _truncate_nonlinear_probe_split_payload(valid_payload, train_eval_seq_len)
+
+    matching_mode = "hungarian" if use_hungarian_for_correlation else "index_to_index"
+    if use_hungarian_for_correlation:
+        train_payload["nominal"] = _apply_supervised_matching_to_variant_payload(train_payload["nominal"])
+        train_payload["recentered"] = _apply_supervised_matching_to_variant_payload(train_payload["recentered"])
+        valid_payload["nominal"] = _apply_supervised_matching_to_variant_payload(valid_payload["nominal"])
+        valid_payload["recentered"] = _apply_supervised_matching_to_variant_payload(valid_payload["recentered"])
+        train_payload["matching"] = matching_mode
+        valid_payload["matching"] = matching_mode
+
+    probe_specs = {
+        "p_only": ["p"],
+        "p_s": ["p", "s"],
+        "p_s_d_t": ["p", "s", "d", "tau"],
+    }
+    results = {
+        "comparison_type": "nominal_vs_recentered_nonlinear_probe",
+        "extraction_method": extraction_method,
+        "reorder_method": reorder_method,
+        "use_hungarian_for_correlation": bool(use_hungarian_for_correlation),
+        "matching": matching_mode,
+        "latent_recenter_source": latent_recenter_source,
+        "latent_recenter_nms_source": latent_recenter_nms_source,
+        "latent_recenter_eps": float(latent_recenter_eps),
+        "train_mode": {
+            "mode": "train",
+            "seq_len": train_eval_seq_len,
+            "num_videos": int(train_payload["gt"].shape[0]),
+        },
+        "valid_mode": {
+            "mode": "valid",
+            "source_seq_len": valid_source_seq_len,
+            "eval_seq_len": train_eval_seq_len,
+            "num_videos": int(valid_payload["gt"].shape[0]),
+        },
+        "probe_config": {
+            "hidden_dim": int(probe_hidden_dim),
+            "num_hidden_layers": int(probe_num_hidden_layers),
+            "epochs": int(probe_epochs),
+            "batch_size": int(probe_batch_size),
+            "lr": float(probe_lr),
+            "weight_decay": float(probe_weight_decay),
+            "seed": int(probe_seed),
+        },
+        "nominal": {},
+        "recentered": {},
+    }
+
+    for variant_idx, variant_name in enumerate(["nominal", "recentered"]):
+        print("\n" + "-" * 80)
+        print(f"Training nonlinear probes for variant='{variant_name}'")
+        print("-" * 80)
+        train_variant = train_payload[variant_name]
+        valid_variant = valid_payload[variant_name]
+        variant_results = {}
+        for probe_idx, (probe_name, feature_names) in enumerate(probe_specs.items()):
+            train_features = _build_nonlinear_probe_feature_tensor(train_variant, probe_name)
+            train_inputs_flat = train_features.reshape(-1, train_features.shape[-1])
+            train_targets_flat = np.asarray(train_variant["gt"], dtype=np.float32).reshape(-1, 2)
+            fit_seed = int(probe_seed) + 100 * variant_idx + probe_idx
+            print(
+                f"  [Probe] {probe_name} | features={feature_names} | "
+                f"train_samples={train_inputs_flat.shape[0]} | input_dim={train_inputs_flat.shape[1]}"
+            )
+            probe_bundle = _fit_nonlinear_probe(
+                train_inputs=train_inputs_flat,
+                train_targets=train_targets_flat,
+                device=device,
+                hidden_dim=probe_hidden_dim,
+                num_hidden_layers=probe_num_hidden_layers,
+                epochs=probe_epochs,
+                batch_size=probe_batch_size,
+                lr=probe_lr,
+                weight_decay=probe_weight_decay,
+                seed=fit_seed,
+            )
+            train_metrics = _evaluate_nonlinear_probe_on_split(probe_bundle, train_variant, probe_name)
+            valid_metrics = _evaluate_nonlinear_probe_on_split(probe_bundle, valid_variant, probe_name)
+
+            variant_results[probe_name] = {
+                "feature_names": feature_names,
+                "input_dim": int(train_inputs_flat.shape[1]),
+                "num_parameters": int(probe_bundle["num_parameters"]),
+                "training": {
+                    "history": probe_bundle["training_history"],
+                    "normalization": {
+                        "input_mean": [float(v) for v in probe_bundle["x_mean"].detach().cpu().numpy().tolist()],
+                        "input_std": [float(v) for v in probe_bundle["x_std"].detach().cpu().numpy().tolist()],
+                        "target_mean": [float(v) for v in probe_bundle["y_mean"].detach().cpu().numpy().tolist()],
+                        "target_std": [float(v) for v in probe_bundle["y_std"].detach().cpu().numpy().tolist()],
+                    },
+                    "fit_config": probe_bundle["config"],
+                },
+                "train": train_metrics,
+                "valid": valid_metrics,
+            }
+        results[variant_name] = variant_results
+
+    metrics_filename = (
+        f"latent_alignment_metrics_nonlinear_{extraction_method}_train_valid_variant_both"
+        f"_source_{latent_recenter_source}_nms_{latent_recenter_nms_source}"
+        f"_reorder_{reorder_method}_hungarian_{'on' if use_hungarian_for_correlation else 'off'}.json"
+    )
+    metrics_path = os.path.join(latent_eval_save_dir, metrics_filename)
+    with open(metrics_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Saved nonlinear latent-alignment metrics to: {metrics_path}")
+    return results
 #####################################################################################
 
 #####################################################################################
@@ -3110,6 +3899,8 @@ def main():
                         help='Whether to extract predicted coordinates for further analysis (0 or 1)')
     parser.add_argument('--evaluate_latent_alignment', type=int, default=0,
                         help='Whether to evaluate latent space alignment with ground truth coordinates (0 or 1)')
+    parser.add_argument('--evaluate_latent_alignment_nonlinear', type=int, default=0,
+                        help='Whether to fit nonlinear MLP probes on train and evaluate on train+valid (0 or 1)')
     parser.add_argument('--evaluate_noisy_gt_reference', type=int, default=0,
                         help='Whether to compute clean-GT vs noisy-GT latent-alignment reference metrics (0 or 1)')
     parser.add_argument('--noisy_gt_noise_mode', type=str, default='relative_step',
@@ -3161,6 +3952,24 @@ def main():
                         help="Which latent coordinates drive NMS/filtering in latent extraction")
     parser.add_argument('--latent_recenter_eps', type=float, default=1e-6,
                         help='Numerical epsilon for recentering centroid computations')
+    parser.add_argument('--nonlinear_train_seq_len', type=int, default=60,
+                        help='Sequence length to extract for train split in nonlinear probe evaluation')
+    parser.add_argument('--nonlinear_valid_seq_len', type=int, default=360,
+                        help='Sequence length to extract for valid split before truncation in nonlinear probe evaluation')
+    parser.add_argument('--nonlinear_probe_hidden_dim', type=int, default=64,
+                        help='Hidden width for nonlinear MLP probes')
+    parser.add_argument('--nonlinear_probe_num_hidden_layers', type=int, default=2,
+                        help='Number of hidden layers for nonlinear MLP probes')
+    parser.add_argument('--nonlinear_probe_epochs', type=int, default=25,
+                        help='Number of epochs for nonlinear MLP probe fitting')
+    parser.add_argument('--nonlinear_probe_batch_size', type=int, default=4096,
+                        help='Batch size for nonlinear MLP probe fitting')
+    parser.add_argument('--nonlinear_probe_lr', type=float, default=1e-3,
+                        help='Learning rate for nonlinear MLP probe fitting')
+    parser.add_argument('--nonlinear_probe_weight_decay', type=float, default=1e-6,
+                        help='Weight decay for nonlinear MLP probe fitting')
+    parser.add_argument('--nonlinear_probe_seed', type=int, default=0,
+                        help='Random seed for nonlinear MLP probe fitting')
 
     args = parser.parse_args()
 
@@ -3206,6 +4015,41 @@ def main():
         raise ValueError(
             "For evaluate_latent_alignment=1, reorder_method must be 'smallest_consecutive_distance'. "
             "Use --use_hungarian_for_correlation=1 for supervised global-ID matching."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and args.reorder_method != 'smallest_consecutive_distance':
+        raise ValueError(
+            "For evaluate_latent_alignment_nonlinear=1, reorder_method must be 'smallest_consecutive_distance'."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and bool(args.evaluate_latent_alignment):
+        raise ValueError(
+            "evaluate_latent_alignment_nonlinear=1 cannot be combined with evaluate_latent_alignment=1. "
+            "Choose one evaluation mode per run."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and bool(args.evaluate_noisy_gt_reference):
+        raise ValueError(
+            "evaluate_latent_alignment_nonlinear=1 cannot be combined with evaluate_noisy_gt_reference=1."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and bool(args.convert_to_ghnn):
+        raise ValueError(
+            "evaluate_latent_alignment_nonlinear=1 cannot be combined with convert_to_ghnn=1."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and args.extraction_method != 'latent':
+        raise ValueError(
+            "evaluate_latent_alignment_nonlinear=1 requires --extraction_method latent."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and args.latent_position_variant != 'both':
+        raise ValueError(
+            "evaluate_latent_alignment_nonlinear=1 requires --latent_position_variant both."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and not bool(args.extract_coordinates):
+        print(
+            "[INFO] evaluate_latent_alignment_nonlinear=1 ignores --extract_coordinates "
+            "and forces coordinate extraction internally."
+        )
+    if bool(args.evaluate_latent_alignment_nonlinear) and int(args.nonlinear_probe_epochs) < 1:
+        raise ValueError(
+            f"evaluate_latent_alignment_nonlinear=1 requires --nonlinear_probe_epochs >= 1, "
+            f"got {args.nonlinear_probe_epochs}."
         )
     if (
         args.latent_position_variant == 'both'
@@ -3309,7 +4153,10 @@ def main():
     checkpoint_name_tag = args.checkpoint_name if args.checkpoint_name is not None else "default"
     extraction_eval_root = os.path.join(args.checkpoint, "extraction_evaluation", checkpoint_name_tag)
 
-    if args.latent_position_variant == 'recentered':
+    if bool(args.evaluate_latent_alignment_nonlinear):
+        visualizations_dirname = "visualizations_comparison"
+        latent_eval_dirname = "latent_alignment_eval_comparison_nonlinear"
+    elif args.latent_position_variant == 'recentered':
         visualizations_dirname = "visualizations_recentred"
         latent_eval_dirname = "latent_alignment_eval_recentred"
     elif args.latent_position_variant == 'both':
@@ -3321,7 +4168,7 @@ def main():
 
     save_dir = os.path.join(extraction_eval_root, visualizations_dirname)
     latent_eval_save_dir = os.path.join(extraction_eval_root, latent_eval_dirname)
-    filtering_report_path = None if bool(args.evaluate_latent_alignment) else os.path.join(extraction_eval_root, "filtering_report.json")
+    filtering_report_path = None if (bool(args.evaluate_latent_alignment) or bool(args.evaluate_latent_alignment_nonlinear)) else os.path.join(extraction_eval_root, "filtering_report.json")
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(latent_eval_save_dir, exist_ok=True)
     if filtering_report_path is not None and os.path.exists(filtering_report_path):
@@ -3332,10 +4179,40 @@ def main():
     if filtering_report_path is not None:
         print(f"Filtering report: {filtering_report_path}")
     else:
-        print("Filtering report: disabled for evaluate_latent_alignment=1")
+        print("Filtering report: disabled for latent-alignment evaluation")
 
     # Evaluate or convert to GHNN format
-    if args.convert_to_ghnn:
+    if bool(args.evaluate_latent_alignment_nonlinear):
+        print("\n" + "="*80)
+        print("RUNNING NONLINEAR LATENT ALIGNMENT EVALUATION")
+        print("="*80)
+        evaluate_latent_alignment_nonlinear_joint(
+            model=model,
+            config=config,
+            device=device,
+            batch_size=args.batch_size,
+            max_batches=args.max_batches,
+            save_dir=save_dir,
+            latent_eval_save_dir=latent_eval_save_dir,
+            use_hungarian_for_correlation=bool(args.use_hungarian_for_correlation),
+            reorder_method=args.reorder_method,
+            extraction_method=args.extraction_method,
+            latent_position_variant=args.latent_position_variant,
+            latent_recenter_source=args.latent_recenter_source,
+            latent_recenter_nms_source=args.latent_recenter_nms_source,
+            latent_recenter_eps=args.latent_recenter_eps,
+            train_seq_len=args.nonlinear_train_seq_len,
+            valid_seq_len=args.nonlinear_valid_seq_len,
+            probe_hidden_dim=args.nonlinear_probe_hidden_dim,
+            probe_num_hidden_layers=args.nonlinear_probe_num_hidden_layers,
+            probe_epochs=args.nonlinear_probe_epochs,
+            probe_batch_size=args.nonlinear_probe_batch_size,
+            probe_lr=args.nonlinear_probe_lr,
+            probe_weight_decay=args.nonlinear_probe_weight_decay,
+            probe_seed=args.nonlinear_probe_seed,
+        )
+        print("\n✅ Nonlinear latent alignment evaluation complete!")
+    elif args.convert_to_ghnn:
         print("\n" + "="*80)
         print("CONVERTING TO GHNN FORMAT")
         print("="*80)
