@@ -12,6 +12,7 @@ LATENT_RECENTER_SOURCE="patch_alpha"
 LATENT_RECENTER_NMS_SOURCE="nominal"
 TRAIN_SEQ_LEN=60
 VALID_SEQ_LEN=360
+NONLINEAR_PROBE_EPOCHS=100
 # ----------------------------
 
 COMMON_ARGS=(
@@ -30,6 +31,7 @@ COMMON_ARGS=(
   --reorder_method smallest_consecutive_distance
   --nonlinear_train_seq_len "${TRAIN_SEQ_LEN}"
   --nonlinear_valid_seq_len "${VALID_SEQ_LEN}"
+  --nonlinear_probe_epochs "${NONLINEAR_PROBE_EPOCHS}"
 )
 
 for use_h in 0 1; do

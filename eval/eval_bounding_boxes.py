@@ -669,7 +669,7 @@ class NonlinearProbeMLP(nn.Module):
             raise ValueError(f"num_hidden_layers must be >= 1, got {num_hidden_layers}")
         for _ in range(num_hidden_layers):
             layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.ReLU(True))
+            layers.append(nn.Tanh())
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, int(output_dim)))
         self.net = nn.Sequential(*layers)
@@ -822,6 +822,17 @@ def _build_nonlinear_probe_feature_tensor(variant_payload, probe_name):
             ],
             axis=-1,
         )
+    if probe_name == "p_s_d_t_feat":
+        return np.concatenate(
+            [
+                np.asarray(variant_payload["p"], dtype=np.float32),
+                np.asarray(variant_payload["s"], dtype=np.float32),
+                np.asarray(variant_payload["d"], dtype=np.float32),
+                np.asarray(variant_payload["tau"], dtype=np.float32),
+                np.asarray(variant_payload["feat"], dtype=np.float32),
+            ],
+            axis=-1,
+        )
     raise ValueError(f"Unknown nonlinear probe '{probe_name}'")
 
 
@@ -842,6 +853,7 @@ def _truncate_nonlinear_probe_split_payload(split_payload, seq_len):
             "s": variant_payload["s"][:, :seq_len].copy(),
             "d": variant_payload["d"][:, :seq_len].copy(),
             "tau": variant_payload["tau"][:, :seq_len].copy(),
+            "feat": variant_payload["feat"][:, :seq_len].copy(),
             "gt": variant_payload["gt"][:, :seq_len].copy(),
         }
     out["gt"] = split_payload["gt"][:, :seq_len].copy()
@@ -854,12 +866,14 @@ def _apply_supervised_matching_to_variant_payload(variant_payload):
     s = np.asarray(variant_payload["s"], dtype=np.float32)
     d = np.asarray(variant_payload["d"], dtype=np.float32)
     tau = np.asarray(variant_payload["tau"], dtype=np.float32)
+    feat = np.asarray(variant_payload["feat"], dtype=np.float32)
 
     V = gt.shape[0]
     p_matched = np.empty_like(p)
     s_matched = np.empty_like(s)
     d_matched = np.empty_like(d)
     tau_matched = np.empty_like(tau)
+    feat_matched = np.empty_like(feat)
     permutations = []
 
     for v in range(V):
@@ -869,12 +883,14 @@ def _apply_supervised_matching_to_variant_payload(variant_payload):
         s_matched[v] = s[v][:, perm, :]
         d_matched[v] = d[v][:, perm, :]
         tau_matched[v] = tau[v][:, perm, :]
+        feat_matched[v] = feat[v][:, perm, :]
 
     return {
         "p": p_matched,
         "s": s_matched,
         "d": d_matched,
         "tau": tau_matched,
+        "feat": feat_matched,
         "gt": gt.copy(),
         "supervised_matching_permutations": permutations,
     }
@@ -1997,8 +2013,8 @@ def video_to_trajectory(
     all_coordinates_recentered = []  # secondary coordinates for latent_position_variant='both'
     gt_coordinates = []  # To store ground-truth coordinates for latent alignment evaluation
     all_frame_mse_per_video = []  # frame-wise reconstruction MSE, list of [T]
-    nonlinear_probe_nominal = {"p": [], "s": [], "d": [], "tau": []}
-    nonlinear_probe_recentered = {"p": [], "s": [], "d": [], "tau": []}
+    nonlinear_probe_nominal = {"p": [], "s": [], "d": [], "tau": [], "feat": []}
+    nonlinear_probe_recentered = {"p": [], "s": [], "d": [], "tau": [], "feat": []}
     recenter_shift_l2_means = []  # mean ||p_can - p|| over kept trajectories
     recenter_valid_fractions = []  # fraction of valid alpha-mass centroids over kept trajectories
     max_failed_videos_to_plot = 10
@@ -2289,6 +2305,7 @@ def video_to_trajectory(
             batch_latent_scale_raw = []
             batch_latent_depth_raw = []
             batch_latent_tau_raw = []
+            batch_latent_feat_raw = []
             
             # ========================================================================
             # EXTRACTION METHOD BRANCHING: bbox vs latent
@@ -2460,9 +2477,11 @@ def video_to_trajectory(
                         latent_scale = mu_scale[video_idx, :, filtered_indices, :].cpu().numpy()
                         latent_depth = z_depth[video_idx, :, filtered_indices, :].cpu().numpy()
                         latent_tau = obj_on[video_idx, :, filtered_indices].unsqueeze(-1).cpu().numpy()
+                        latent_feat = model_output['z_features'][video_idx, :, filtered_indices, :].cpu().numpy()
                         batch_latent_scale_raw.append(latent_scale)
                         batch_latent_depth_raw.append(latent_depth)
                         batch_latent_tau_raw.append(latent_tau)
+                        batch_latent_feat_raw.append(latent_feat)
 
                     batch_coordinates.append(latent_positions)  # [T, K, 2] in kp_range
                     if latent_position_variant == 'both':
@@ -2733,6 +2752,15 @@ def video_to_trajectory(
                         axis=0,
                     )
                 )
+                nonlinear_probe_nominal["feat"].append(
+                    np.stack(
+                        [
+                            _apply_temporal_permutation(batch_latent_feat_raw[i], reordered_batch_permutations[i])
+                            for i in range(len(batch_latent_feat_raw))
+                        ],
+                        axis=0,
+                    )
+                )
 
                 if extraction_method == 'latent' and latent_position_variant == 'both':
                     if reordered_batch_coordinates_recentered is None or reordered_batch_permutations_recentered is None:
@@ -2763,6 +2791,15 @@ def video_to_trajectory(
                             [
                                 _apply_temporal_permutation(batch_latent_tau_raw[i], reordered_batch_permutations_recentered[i])
                                 for i in range(len(batch_latent_tau_raw))
+                            ],
+                            axis=0,
+                        )
+                    )
+                    nonlinear_probe_recentered["feat"].append(
+                        np.stack(
+                            [
+                                _apply_temporal_permutation(batch_latent_feat_raw[i], reordered_batch_permutations_recentered[i])
+                                for i in range(len(batch_latent_feat_raw))
                             ],
                             axis=0,
                         )
@@ -2918,6 +2955,7 @@ def video_to_trajectory(
                     "s": np.concatenate(nonlinear_probe_nominal["s"], axis=0),
                     "d": np.concatenate(nonlinear_probe_nominal["d"], axis=0),
                     "tau": np.concatenate(nonlinear_probe_nominal["tau"], axis=0),
+                    "feat": np.concatenate(nonlinear_probe_nominal["feat"], axis=0),
                 },
             }
             if latent_position_variant == 'both':
@@ -2931,6 +2969,7 @@ def video_to_trajectory(
                     "s": np.concatenate(nonlinear_probe_recentered["s"], axis=0),
                     "d": np.concatenate(nonlinear_probe_recentered["d"], axis=0),
                     "tau": np.concatenate(nonlinear_probe_recentered["tau"], axis=0),
+                    "feat": np.concatenate(nonlinear_probe_recentered["feat"], axis=0),
                 }
 
         if returns:
@@ -3258,6 +3297,7 @@ def evaluate_latent_alignment_nonlinear_joint(
         "p_only": ["p"],
         "p_s": ["p", "s"],
         "p_s_d_t": ["p", "s", "d", "tau"],
+        "p_s_d_t_feat": ["p", "s", "d", "tau", "feat"],
     }
     results = {
         "comparison_type": "nominal_vs_recentered_nonlinear_probe",

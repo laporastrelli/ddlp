@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ROOT="/data2/users/lr4617/ddlp"
 BASE_CONFIG="$PROJECT_ROOT/configs/twobody_minimal_off_cnt.json"
-RUN_DIR="$PROJECT_ROOT/outputs/280326_092047_twobody_ddlp_minimal_off_cnt_BIG"
+RUN_DIR="$PROJECT_ROOT/outputs/220326_184923_twobody_ddlp_minimal_off_cnt_BIG"
 SAVES_DIR="$RUN_DIR/saves"
 
 if [[ ! -d "$SAVES_DIR" ]]; then
