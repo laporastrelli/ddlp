@@ -16,6 +16,7 @@ import sys
 import json
 import argparse
 import math
+from copy import deepcopy
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -36,15 +37,39 @@ if parent_dir not in sys.path:
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import torchvision.utils as vutils
 
 # datasets
 from datasets.get_dataset import get_video_dataset
-from utils.util_func import plot_bb_on_image_batch_from_z_scale_nms, plot_bb_on_image_batch_from_masks_nms
+from utils.util_func import (
+    plot_keypoints_on_image_batch,
+    plot_bb_on_image_batch_from_z_scale_nms,
+    plot_bb_on_image_batch_from_masks_nms,
+)
 
 # models
 from models import ObjectDynamicsDLP
 
 import sys
+
+#####################################################################################
+def _extract_model_state_dict(checkpoint_obj):
+    """Return the state dict from common DDLP / probabilistic-encoder checkpoint payloads."""
+    if isinstance(checkpoint_obj, dict):
+        if 'model_state_dict' in checkpoint_obj:
+            return checkpoint_obj['model_state_dict']
+        if 'model' in checkpoint_obj:
+            return checkpoint_obj['model']
+        if 'state_dict' in checkpoint_obj:
+            return checkpoint_obj['state_dict']
+    return checkpoint_obj
+
+
+def _load_checkpoint_into_model(model, checkpoint_path, device, strict=True):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(_extract_model_state_dict(checkpoint), strict=strict)
+    return checkpoint
+
 
 #####################################################################################
 def create_pred_only_trajectory_videos(video_data_list, save_dir='./', mode='valid'):
@@ -929,6 +954,8 @@ def evaluate_latent_alignment_metrics(
     include_bbox_smoothing_tag_in_filename=True,
     include_reorder_hungarian_tags_in_filename=True,
     extra_metadata=None,
+    raw_physical_gt_coordinates=None,
+    raw_physical_gt_metadata=None,
 ):
     if pred_coordinates is None:
         raise RuntimeError("pred_coordinates is None. Make sure extract_coordinates=True and all_coordinates is concatenated.")
@@ -1053,10 +1080,14 @@ def evaluate_latent_alignment_metrics(
         """
         per_video_mean_pearson = []
         per_video_mean_pearson_vel = []
+        per_video_mean_pearson_acc = []
         per_video_rmse = []
         per_video_nrmse_bbox = []
         per_video_nrmse_std = []
         per_video_r2 = []
+        per_video_smoothness_ratio = []
+        per_video_acc_rms_aligned = []
+        per_video_acc_rms_target = []
 
         for v in range(V):
             A = aligned[v]
@@ -1079,6 +1110,26 @@ def evaluate_latent_alignment_metrics(
             else:
                 per_video_mean_pearson_vel.append(0.0)
 
+            if T >= 3:
+                ddA = A[2:] - 2.0 * A[1:-1] + A[:-2]
+                ddY = Y[2:] - 2.0 * Y[1:-1] + Y[:-2]
+                ras = []
+                for n in range(N):
+                    ras.append(_pearson_1d(ddA[:, n, 0], ddY[:, n, 0], eps=eps))
+                    ras.append(_pearson_1d(ddA[:, n, 1], ddY[:, n, 1], eps=eps))
+                per_video_mean_pearson_acc.append(float(np.mean(ras)) if len(ras) > 0 else 0.0)
+
+                acc_rms_A = float(np.sqrt(np.mean(ddA ** 2)))
+                acc_rms_Y = float(np.sqrt(np.mean(ddY ** 2)))
+                per_video_acc_rms_aligned.append(acc_rms_A)
+                per_video_acc_rms_target.append(acc_rms_Y)
+                per_video_smoothness_ratio.append(acc_rms_A / (acc_rms_Y + eps))
+            else:
+                per_video_mean_pearson_acc.append(0.0)
+                per_video_acc_rms_aligned.append(0.0)
+                per_video_acc_rms_target.append(0.0)
+                per_video_smoothness_ratio.append(0.0)
+
             rmse_v = _rmse(A, Y)
             per_video_rmse.append(rmse_v)
 
@@ -1092,16 +1143,28 @@ def evaluate_latent_alignment_metrics(
 
         mean_r, std_r = _mean_std(per_video_mean_pearson)
         mean_rv, std_rv = _mean_std(per_video_mean_pearson_vel)
+        mean_ra, std_ra = _mean_std(per_video_mean_pearson_acc)
         mean_rmse, std_rmse = _mean_std(per_video_rmse)
         mean_nrmse_bbox, std_nrmse_bbox = _mean_std(per_video_nrmse_bbox)
         mean_nrmse_std, std_nrmse_std = _mean_std(per_video_nrmse_std)
         mean_r2, std_r2 = _mean_std(per_video_r2)
+        mean_smooth, std_smooth = _mean_std(per_video_smoothness_ratio)
+        mean_acc_A, std_acc_A = _mean_std(per_video_acc_rms_aligned)
+        mean_acc_Y, std_acc_Y = _mean_std(per_video_acc_rms_target)
 
         return {
             "mean_pearson_pos_mean": mean_r,
             "mean_pearson_pos_std": std_r,
             "mean_pearson_vel_mean": mean_rv,
             "mean_pearson_vel_std": std_rv,
+            "mean_pearson_acc_mean": mean_ra,
+            "mean_pearson_acc_std": std_ra,
+            "smoothness_ratio_acc_rms_mean": mean_smooth,
+            "smoothness_ratio_acc_rms_std": std_smooth,
+            "acc_rms_aligned_mean": mean_acc_A,
+            "acc_rms_aligned_std": std_acc_A,
+            "acc_rms_target_mean": mean_acc_Y,
+            "acc_rms_target_std": std_acc_Y,
             "rmse_mean": mean_rmse,
             "rmse_std": std_rmse,
             "nrmse_bbox_mean": mean_nrmse_bbox,
@@ -1112,10 +1175,62 @@ def evaluate_latent_alignment_metrics(
             "r2_std": std_r2,
         }
 
+    def _compute_linear_fit_metric_bundle(target_coordinates):
+        """Compute all linear alignment blocks for the already selected pred_eval."""
+        if target_coordinates.shape != pred_eval.shape:
+            raise ValueError(
+                f"Shape mismatch pred {pred_eval.shape} vs target {target_coordinates.shape}."
+            )
+
+        s_fwd_local, b_fwd_local = _fit_uniform_scale_translation(pred_eval, target_coordinates, eps=eps)
+        pred_uniform_fwd_local = _apply_uniform_transform(pred_eval, s_fwd_local, b_fwd_local)
+        metrics_uniform_fwd_local = _compute_alignment_metrics(pred_uniform_fwd_local, target_coordinates)
+        metrics_uniform_fwd_local["fit_params"] = {
+            "scale": float(s_fwd_local),
+            "translation": [float(b_fwd_local[0]), float(b_fwd_local[1])],
+        }
+
+        s_rev_local, b_rev_local = _fit_uniform_scale_translation(target_coordinates, pred_eval, eps=eps)
+        target_uniform_rev_local = _apply_uniform_transform(target_coordinates, s_rev_local, b_rev_local)
+        metrics_uniform_rev_local = _compute_alignment_metrics(target_uniform_rev_local, pred_eval)
+        metrics_uniform_rev_local["fit_params"] = {
+            "scale": float(s_rev_local),
+            "translation": [float(b_rev_local[0]), float(b_rev_local[1])],
+        }
+
+        W_fwd_local, t_fwd_local = _fit_affine_transform(pred_eval, target_coordinates)
+        pred_affine_fwd_local = _apply_affine_transform(pred_eval, W_fwd_local, t_fwd_local)
+        metrics_affine_fwd_local = _compute_alignment_metrics(pred_affine_fwd_local, target_coordinates)
+        metrics_affine_fwd_local["fit_params"] = {
+            "matrix": [[float(W_fwd_local[0, 0]), float(W_fwd_local[0, 1])],
+                       [float(W_fwd_local[1, 0]), float(W_fwd_local[1, 1])]],
+            "translation": [float(t_fwd_local[0]), float(t_fwd_local[1])],
+            "determinant": float(np.linalg.det(W_fwd_local)),
+        }
+
+        W_rev_local, t_rev_local = _fit_affine_transform(target_coordinates, pred_eval)
+        target_affine_rev_local = _apply_affine_transform(target_coordinates, W_rev_local, t_rev_local)
+        metrics_affine_rev_local = _compute_alignment_metrics(target_affine_rev_local, pred_eval)
+        metrics_affine_rev_local["fit_params"] = {
+            "matrix": [[float(W_rev_local[0, 0]), float(W_rev_local[0, 1])],
+                       [float(W_rev_local[1, 0]), float(W_rev_local[1, 1])]],
+            "translation": [float(t_rev_local[0]), float(t_rev_local[1])],
+            "determinant": float(np.linalg.det(W_rev_local)),
+        }
+
+        return {
+            "uniform_forward": metrics_uniform_fwd_local,
+            "uniform_reverse": metrics_uniform_rev_local,
+            "affine_forward": metrics_affine_fwd_local,
+            "affine_reverse": metrics_affine_rev_local,
+        }
+
     def _print_metrics_block(title, metrics, params=None):
         print(f"{title}")
         print(f"  Mean Pearson (pos)       : {metrics['mean_pearson_pos_mean']:.4f} ± {metrics['mean_pearson_pos_std']:.4f}")
         print(f"  Mean Pearson (vel, diff) : {metrics['mean_pearson_vel_mean']:.4f} ± {metrics['mean_pearson_vel_std']:.4f}")
+        print(f"  Mean Pearson (acc, diff2): {metrics['mean_pearson_acc_mean']:.4f} ± {metrics['mean_pearson_acc_std']:.4f}")
+        print(f"  Smoothness ratio (acc)   : {metrics['smoothness_ratio_acc_rms_mean']:.4f} ± {metrics['smoothness_ratio_acc_rms_std']:.4f}")
         print(f"  RMSE (aligned)           : {metrics['rmse_mean']:.6f} ± {metrics['rmse_std']:.6f}")
         print(f"  NRMSE (bbox diag)        : {metrics['nrmse_bbox_mean']:.6f} ± {metrics['nrmse_bbox_std']:.6f}")
         print(f"  NRMSE (target std)       : {metrics['nrmse_std_mean']:.6f} ± {metrics['nrmse_std_std']:.6f}")
@@ -1136,45 +1251,34 @@ def evaluate_latent_alignment_metrics(
         pred_eval = pred_coordinates
         matching_mode = "index_to_index"
 
-    # Uniform forward: pred -> gt
-    s_fwd, b_fwd = _fit_uniform_scale_translation(pred_eval, gt_coordinates_, eps=eps)
-    pred_uniform_fwd = _apply_uniform_transform(pred_eval, s_fwd, b_fwd)
-    metrics_uniform_fwd = _compute_alignment_metrics(pred_uniform_fwd, gt_coordinates_)
-    metrics_uniform_fwd["fit_params"] = {
-        "scale": float(s_fwd),
-        "translation": [float(b_fwd[0]), float(b_fwd[1])],
-    }
+    image_space_metrics = _compute_linear_fit_metric_bundle(gt_coordinates_)
+    metrics_uniform_fwd = image_space_metrics["uniform_forward"]
+    metrics_uniform_rev = image_space_metrics["uniform_reverse"]
+    metrics_affine_fwd = image_space_metrics["affine_forward"]
+    metrics_affine_rev = image_space_metrics["affine_reverse"]
 
-    # Uniform reverse: gt -> pred
-    s_rev, b_rev = _fit_uniform_scale_translation(gt_coordinates_, pred_eval, eps=eps)
-    gt_uniform_rev = _apply_uniform_transform(gt_coordinates_, s_rev, b_rev)
-    metrics_uniform_rev = _compute_alignment_metrics(gt_uniform_rev, pred_eval)
-    metrics_uniform_rev["fit_params"] = {
-        "scale": float(s_rev),
-        "translation": [float(b_rev[0]), float(b_rev[1])],
-    }
-
-    # Full affine forward: pred -> gt
-    W_fwd, t_fwd = _fit_affine_transform(pred_eval, gt_coordinates_)
-    pred_affine_fwd = _apply_affine_transform(pred_eval, W_fwd, t_fwd)
-    metrics_affine_fwd = _compute_alignment_metrics(pred_affine_fwd, gt_coordinates_)
-    metrics_affine_fwd["fit_params"] = {
-        "matrix": [[float(W_fwd[0, 0]), float(W_fwd[0, 1])],
-                   [float(W_fwd[1, 0]), float(W_fwd[1, 1])]],
-        "translation": [float(t_fwd[0]), float(t_fwd[1])],
-        "determinant": float(np.linalg.det(W_fwd)),
-    }
-
-    # Full affine reverse: gt -> pred
-    W_rev, t_rev = _fit_affine_transform(gt_coordinates_, pred_eval)
-    gt_affine_rev = _apply_affine_transform(gt_coordinates_, W_rev, t_rev)
-    metrics_affine_rev = _compute_alignment_metrics(gt_affine_rev, pred_eval)
-    metrics_affine_rev["fit_params"] = {
-        "matrix": [[float(W_rev[0, 0]), float(W_rev[0, 1])],
-                   [float(W_rev[1, 0]), float(W_rev[1, 1])]],
-        "translation": [float(t_rev[0]), float(t_rev[1])],
-        "determinant": float(np.linalg.det(W_rev)),
-    }
+    raw_physical_metrics = None
+    if raw_physical_gt_coordinates is not None:
+        raw_physical_gt_coordinates = np.asarray(raw_physical_gt_coordinates, dtype=np.float64)
+        if raw_physical_gt_coordinates.shape != gt_coordinates_.shape:
+            raise ValueError(
+                f"Shape mismatch raw physical gt {raw_physical_gt_coordinates.shape} "
+                f"vs image-space gt {gt_coordinates_.shape}."
+            )
+        raw_physical_metrics = _compute_linear_fit_metric_bundle(raw_physical_gt_coordinates)
+        raw_physical_metrics["target_coordinate_system"] = "raw_physical_yx"
+        raw_physical_metrics["target_coordinate_note"] = (
+            "Raw physical coordinates are stored in latent-compatible [y, x] order. "
+            "For two-body data this preserves object order while exposing the vertical-axis "
+            "flip and physical-unit scaling relative to rendered image coordinates."
+        )
+        raw_physical_metrics["matching_note"] = (
+            "If Hungarian matching is enabled, predicted objects are matched once using "
+            "the rendered-image latent target; the same matched prediction ordering is "
+            "then reused for raw-physical metrics."
+        )
+        if raw_physical_gt_metadata is not None:
+            raw_physical_metrics["metadata"] = raw_physical_gt_metadata
 
     print("\n" + "=" * 80)
     print(f"LATENT ALIGNMENT METRICS (matching={matching_mode})")
@@ -1203,6 +1307,9 @@ def evaluate_latent_alignment_metrics(
         metrics_affine_rev,
         params=metrics_affine_rev["fit_params"]
     )
+    if raw_physical_metrics is not None:
+        print("-" * 80)
+        print("RAW PHYSICAL TARGET METRICS available in JSON under key: raw_physical")
     print("=" * 80 + "\n")
 
     # Optional: save top-k visual comparisons of supervised reordering effect
@@ -1297,11 +1404,25 @@ def evaluate_latent_alignment_metrics(
         "T": T,
         "N": N,
         "matching": matching_mode,
+        "target_coordinate_system": "rendered_image_latent_yx",
+        "metric_definitions": {
+            "velocity": "first temporal difference q[t+1] - q[t]",
+            "discrete_acceleration": (
+                "second temporal difference q[t+2] - 2*q[t+1] + q[t]; "
+                "the common dt^-2 factor is omitted"
+            ),
+            "smoothness_ratio_acc_rms": (
+                "RMS discrete acceleration of the aligned prediction divided by "
+                "RMS discrete acceleration of the target"
+            ),
+        },
         "uniform_forward": metrics_uniform_fwd,
         "uniform_reverse": metrics_uniform_rev,
         "affine_forward": metrics_affine_fwd,
         "affine_reverse": metrics_affine_rev,
     }
+    if raw_physical_metrics is not None:
+        metrics_out["raw_physical"] = raw_physical_metrics
     if extra_metadata is not None:
         metrics_out["extra_metadata"] = extra_metadata
 
@@ -1714,6 +1835,364 @@ def _recenter_positions_global_alpha(mu_tot, alpha_masks, eps=1e-6):
     mu_global_yx, valid_mask = _alpha_centroid_yx(alpha_global, eps=eps)
     p_can = torch.where(valid_mask.unsqueeze(-1), mu_global_yx, mu_tot)
     return p_can, valid_mask
+
+
+def _convert_gt_xy_pixels_to_latent_yx(gt_xy_pixels, image_height, image_width, kp_range):
+    """
+    Convert dataset GT positions from pixel [x, y] into DDLP latent [y, x].
+    The output uses the same kp_range normalization as DDLP keypoints.
+    """
+    gt_xy = np.asarray(gt_xy_pixels, dtype=np.float32)
+    if gt_xy.ndim < 2 or gt_xy.shape[-1] != 2:
+        raise ValueError(f"Expected GT positions with trailing dim=2 [x,y], got shape={gt_xy.shape}")
+
+    image_height = int(image_height)
+    image_width = int(image_width)
+    if image_height <= 1 or image_width <= 1:
+        raise ValueError(
+            f"Image height/width must be > 1 for pixel normalization, got H={image_height}, W={image_width}"
+        )
+
+    kp_min, kp_max = float(kp_range[0]), float(kp_range[1])
+    kp_span = kp_max - kp_min
+    x_latent = (gt_xy[..., 0] / float(image_width - 1)) * kp_span + kp_min
+    y_latent = (gt_xy[..., 1] / float(image_height - 1)) * kp_span + kp_min
+    return np.stack([y_latent, x_latent], axis=-1).astype(np.float32, copy=False)
+
+
+def _looks_like_twobody_physical_npz_root(path):
+    if path is None:
+        return False
+    return (
+        os.path.isdir(path)
+        and os.path.isdir(os.path.join(path, "training_trajectory"))
+        and os.path.isdir(os.path.join(path, "validation_trajectory"))
+    )
+
+
+def _resolve_twobody_physical_npz_root(dataset_root, raw_physical_npz_root="auto"):
+    """
+    Resolve the synchronized raw-physics NPZ root for two-body DDLP HDF5 datasets.
+
+    Existing DDLP HDF5 files store rendered pixel positions only. The companion
+    *_npz directory stores the synchronized raw physical trajectories and the
+    global render bounds used to produce those pixels.
+    """
+    if raw_physical_npz_root is None:
+        return None
+
+    raw_arg = str(raw_physical_npz_root).strip()
+    if raw_arg == "" or raw_arg.lower() in {"none", "off", "false", "0"}:
+        return None
+
+    if raw_arg.lower() != "auto":
+        return os.path.abspath(os.path.expanduser(raw_arg))
+
+    if dataset_root is None:
+        return None
+
+    dataset_root = os.path.abspath(os.path.expanduser(str(dataset_root)))
+    parent = os.path.dirname(dataset_root)
+    base = os.path.basename(dataset_root)
+    candidates = []
+
+    def _add_candidate(path):
+        if path is not None and path not in candidates:
+            candidates.append(path)
+
+    _add_candidate(dataset_root.replace("_hdf5", "_npz"))
+    if base.endswith("_hdf5"):
+        _add_candidate(os.path.join(parent, base[:-5] + "_npz"))
+    if "_hdf5" in base:
+        _add_candidate(os.path.join(parent, base.replace("_hdf5", "_npz")))
+
+    for candidate in candidates:
+        if _looks_like_twobody_physical_npz_root(candidate):
+            return candidate
+    return None
+
+
+def _twobody_dataset_index_to_npz_slice(dataset, item_index):
+    """
+    Mirror TwoBodyDataset.__getitem__ indexing so raw NPZ trajectories align with
+    the exact video subsequence fed through the DDLP model.
+    """
+    mode = getattr(dataset, "mode", None)
+    sample_length = int(getattr(dataset, "sample_length", 0))
+
+    if mode == "train":
+        split_dir = "training_trajectory"
+        if getattr(dataset, "use_subsequences", False):
+            seq_per_episode = int(getattr(dataset, "seq_per_episode", 1))
+            episode_idx = int(item_index) // seq_per_episode
+            subseq_idx = int(item_index) % seq_per_episode
+            start_frame = subseq_idx * sample_length
+            end_frame = start_frame + sample_length
+        else:
+            episode_idx = int(item_index)
+            start_frame = 0
+            end_frame = int(getattr(dataset, "max_eval_frames", sample_length))
+    else:
+        # The current BIG DDLP test.hdf5 is a copy of val.hdf5, and the
+        # synchronized raw trajectories are stored under validation_trajectory.
+        split_dir = "validation_trajectory"
+        episode_idx = int(item_index)
+        start_frame = 0
+        end_frame = int(getattr(dataset, "max_eval_frames", sample_length))
+
+    return split_dir, episode_idx, start_frame, end_frame
+
+
+def _load_twobody_raw_physical_yx_sequence(
+    npz_root,
+    dataset,
+    item_index,
+    expected_T=None,
+    cache=None,
+):
+    """
+    Load raw physical coordinates for one TwoBodyDataset item.
+
+    Returns coordinates in [T, N, 2] with DDLP-compatible trailing order [y, x].
+    The raw NPZ trajectory columns are [x_1, y_1, x_2, y_2, ...].
+    """
+    if npz_root is None:
+        return None, "raw physical NPZ root is not configured"
+
+    split_dir, episode_idx, start_frame, end_frame = _twobody_dataset_index_to_npz_slice(dataset, item_index)
+    npz_path = os.path.join(npz_root, split_dir, f"trajectory_{episode_idx}.npz")
+    if not os.path.exists(npz_path):
+        return None, f"missing raw physical NPZ file: {npz_path}"
+
+    cache_key = (split_dir, episode_idx)
+    if cache is not None and cache_key in cache:
+        trajectory = cache[cache_key]
+    else:
+        with np.load(npz_path, allow_pickle=True) as payload:
+            if "trajectory" not in payload:
+                return None, f"NPZ file has no 'trajectory' array: {npz_path}"
+            trajectory = np.asarray(payload["trajectory"], dtype=np.float32)
+        if cache is not None:
+            cache[cache_key] = trajectory
+
+    if trajectory.ndim != 2 or trajectory.shape[1] % 2 != 0:
+        return None, f"raw physical trajectory has invalid shape {trajectory.shape}: {npz_path}"
+
+    if expected_T is not None:
+        end_frame = start_frame + int(expected_T)
+
+    if start_frame < 0 or end_frame > trajectory.shape[0]:
+        return None, (
+            f"requested raw physical slice [{start_frame}:{end_frame}] exceeds "
+            f"trajectory length {trajectory.shape[0]} for {npz_path}"
+        )
+
+    xy = trajectory[start_frame:end_frame].reshape(end_frame - start_frame, -1, 2)
+    yx = xy[..., [1, 0]]
+    return yx.astype(np.float32, copy=False), None
+
+
+def _reshape_sequence_model_output(raw_output, sequence_model, x):
+    """Reshape one DDLP forward output from [B*T, ...] tensors to [B,T,...]."""
+    B = x.shape[0]
+    T = x.shape[1]
+    n_kp = sequence_model.n_kp_enc
+
+    kp_p_flat = raw_output.get('kp_p', None)
+    if (
+        kp_p_flat is None
+        or (not torch.is_tensor(kp_p_flat))
+        or kp_p_flat.ndim != 3
+        or kp_p_flat.shape[0] != (B * T)
+        or kp_p_flat.shape[-1] != 2
+    ):
+        kp_p_reshaped = (raw_output['z_base'] + raw_output['mu_offset']).view(B, T, n_kp, 2)
+    else:
+        kp_p_reshaped = kp_p_flat.view(B, T, kp_p_flat.shape[1], 2)
+
+    return {
+        'kp_p': kp_p_reshaped,
+        'z_base': raw_output['z_base'].view(B, T, n_kp, 2),
+        'z': raw_output['z'].view(B, T, n_kp, 2),
+        'mu_offset': raw_output['mu_offset'].view(B, T, n_kp, 2),
+        'logvar_offset': raw_output['logvar_offset'].view(B, T, n_kp, 2),
+        'mu_depth': raw_output['mu_depth'].view(B, T, n_kp, 1),
+        'z_depth': raw_output['z_depth'].view(B, T, n_kp, 1),
+        'mu_scale': raw_output['mu_scale'].view(B, T, n_kp, 2),
+        'z_scale': raw_output['z_scale'].view(B, T, n_kp, 2),
+        'obj_on': raw_output['obj_on'].view(B, T, n_kp),
+        'z_features': raw_output['z_features'].view(B, T, n_kp, -1),
+        'z_bg': raw_output['z_bg'].view(B, T, -1),
+        'alpha_masks': raw_output['alpha_masks'].view(B, T, n_kp, 1, x.shape[3], x.shape[4]),
+        'dec_objects_original': raw_output['dec_objects_original'].view(B, T, n_kp, *raw_output['dec_objects_original'].shape[2:]),
+        'dec_objects': raw_output['dec_objects'].view(B, T, x.shape[2], x.shape[3], x.shape[4]),
+        'bg': raw_output['bg'].view(B, T, x.shape[2], x.shape[3], x.shape[4]),
+        'rec': raw_output['rec'].view(B, T, x.shape[2], x.shape[3], x.shape[4]),
+    }
+
+
+def _encode_sequence_model(sequence_model, x, config, label="model"):
+    """Run DDLP temporal encoding and return outputs shaped [B,T,...]."""
+    T = x.shape[1]
+    timestep_horizon = config['timestep_horizon']
+
+    if T <= timestep_horizon:
+        raw_output = sequence_model(x, x_prior=x, deterministic=True, forward_dyn=True)
+        return _reshape_sequence_model_output(raw_output, sequence_model, x)
+
+    print(f"Autoregressive encoding ({label}): {T} frames in chunks of {timestep_horizon}")
+
+    all_outputs = []
+    continuation_state = None
+    for chunk_start in range(0, T, timestep_horizon):
+        print("" + "=" * 60)
+        print(
+            f"  Processing {label} chunk: frames "
+            f"{chunk_start} to {min(chunk_start + timestep_horizon, T) - 1}"
+        )
+        print("" + "=" * 60)
+
+        chunk_end = min(chunk_start + timestep_horizon, T)
+        x_chunk = x[:, chunk_start:chunk_end]
+        assert x_chunk.shape[1] == timestep_horizon, (
+            f"Autoregressive chunk merge requires fixed chunk length equal to timestep_horizon. "
+            f"Got chunk_len={x_chunk.shape[1]} vs timestep_horizon={timestep_horizon}. "
+            f"Use eval_seq_len as a multiple of timestep_horizon."
+        )
+
+        if chunk_start == 0:
+            x_prior_chunk = x_chunk
+        else:
+            x_prior_chunk = torch.cat(
+                [x[:, chunk_start - 1:chunk_start], x_chunk[:, :-1]],
+                dim=1,
+            )
+
+        chunk_output = sequence_model(
+            x_chunk.contiguous(),
+            x_prior=x_prior_chunk.contiguous(),
+            deterministic=True,
+            forward_dyn=True,
+            continuation_state=continuation_state,
+        )
+        all_outputs.append(chunk_output)
+        continuation_state = chunk_output['continuation_state']
+
+    num_chunks = len(all_outputs)
+    B = x.shape[0]
+    chunk_T = timestep_horizon
+
+    def reshape_chunk_outputs(outputs_list):
+        stacked = torch.stack(outputs_list, dim=0)
+        remaining_dims = stacked.shape[2:]
+        stacked = stacked.view(num_chunks, B, chunk_T, *remaining_dims)
+        stacked = stacked.transpose(0, 1).contiguous()
+        total_T = num_chunks * chunk_T
+        return stacked.view(B, total_T, *remaining_dims)
+
+    kp_p_chunks = []
+    for out in all_outputs:
+        kp_chunk = out.get('kp_p', None)
+        expected_shape = out['z_base'].shape
+        if (
+            kp_chunk is None
+            or (not torch.is_tensor(kp_chunk))
+            or kp_chunk.shape != expected_shape
+        ):
+            kp_chunk = out['z_base'] + out['mu_offset']
+        kp_p_chunks.append(kp_chunk)
+
+    return {
+        'kp_p': reshape_chunk_outputs(kp_p_chunks),
+        'z_base': reshape_chunk_outputs([out['z_base'] for out in all_outputs]),
+        'z': reshape_chunk_outputs([out['z'] for out in all_outputs]),
+        'mu_offset': reshape_chunk_outputs([out['mu_offset'] for out in all_outputs]),
+        'logvar_offset': reshape_chunk_outputs([out['logvar_offset'] for out in all_outputs]),
+        'mu_depth': reshape_chunk_outputs([out['mu_depth'] for out in all_outputs]),
+        'z_depth': reshape_chunk_outputs([out['z_depth'] for out in all_outputs]),
+        'mu_scale': reshape_chunk_outputs([out['mu_scale'] for out in all_outputs]),
+        'z_scale': reshape_chunk_outputs([out['z_scale'] for out in all_outputs]),
+        'obj_on': reshape_chunk_outputs([out['obj_on'] for out in all_outputs]),
+        'z_features': reshape_chunk_outputs([out['z_features'] for out in all_outputs]),
+        'z_bg': reshape_chunk_outputs([out['z_bg'] for out in all_outputs]),
+        'alpha_masks': reshape_chunk_outputs([out['alpha_masks'] for out in all_outputs]),
+        'dec_objects_original': reshape_chunk_outputs([out['dec_objects_original'] for out in all_outputs]),
+        'dec_objects': reshape_chunk_outputs([out['dec_objects'] for out in all_outputs]),
+        'bg': reshape_chunk_outputs([out['bg'] for out in all_outputs]),
+        'rec': reshape_chunk_outputs([out['rec'] for out in all_outputs]),
+    }
+
+
+def _build_prob_encoder_route_mean(
+    route,
+    train_out,
+    frozen_out,
+    latent_recenter_source,
+    latent_recenter_eps,
+    kp_range,
+):
+    """Reconstruct the probabilistic encoder mean for C1-family checkpoints."""
+    kp_min, kp_max = float(kp_range[0]), float(kp_range[1])
+    mu_nom_train = train_out['z_base'] + train_out['mu_offset']
+    if route not in {'c1', 'c1-dyn-attrs'}:
+        raise ValueError(
+            f"Unknown probabilistic encoder route: {route}. "
+            "Expected one of ['c1','c1-dyn-attrs']."
+        )
+    if frozen_out is None:
+        raise RuntimeError(
+            "prob_encoder_route in {'c1','c1-dyn-attrs'} requires a frozen base DDLP output."
+        )
+
+    mu_nom_frozen = frozen_out['z_base'] + frozen_out['mu_offset']
+    if latent_recenter_source == 'patch_alpha':
+        c0, valid_mask = _recenter_positions_patch_alpha(
+            mu_tot=mu_nom_frozen,
+            mu_scale=frozen_out['mu_scale'],
+            dec_objects_original=frozen_out['dec_objects_original'],
+            eps=latent_recenter_eps,
+        )
+    elif latent_recenter_source == 'global_alpha':
+        c0, valid_mask = _recenter_positions_global_alpha(
+            mu_tot=mu_nom_frozen,
+            alpha_masks=frozen_out['alpha_masks'],
+            eps=latent_recenter_eps,
+        )
+    else:
+        raise ValueError(f"Unknown recenter source: {latent_recenter_source}")
+
+    delta = mu_nom_train - mu_nom_frozen.detach()
+    return (c0.detach() + delta).clamp(min=kp_min, max=kp_max), valid_mask
+
+
+def _normalize_prob_encoder_route(route):
+    """Return the canonical probabilistic-encoder route label."""
+    route_key = "none" if route is None else str(route).strip()
+    aliases = {
+        "none": "none",
+        "c1": "c1",
+        "c1-dyn-attrs": "c1-dyn-attrs",
+        "c1_dyn_attrs": "c1-dyn-attrs",
+    }
+    if route_key not in aliases:
+        raise ValueError(
+            "prob_encoder_route must be one of "
+            "['none','c1','c1-dyn-attrs','c1_dyn_attrs'], "
+            f"got '{route}'"
+        )
+    return aliases[route_key]
+
+
+def _prob_encoder_output_dirname(route, output_tag=None):
+    """Directory name used for outputs produced from probabilistic encoders."""
+    if output_tag is not None:
+        tag = str(output_tag).strip()
+        if tag != "" and tag.lower() != "auto":
+            return f"prob_encoder_{tag.replace('-', '_')}"
+    route = _normalize_prob_encoder_route(route)
+    if route == "none":
+        return None
+    return f"prob_encoder_{route.replace('-', '_')}"
 #####################################################################################
 
 #####################################################################################
@@ -1742,6 +2221,10 @@ def video_to_trajectory(
     latent_recenter_eps=1e-6,
     collect_nonlinear_probe_inputs=False,
     return_nonlinear_probe_payload=False,
+    respect_max_batches_for_extraction=False,
+    prob_encoder_route='none',
+    prob_encoder_frozen_model=None,
+    raw_physical_npz_root='auto',
 ):
     """
     Collect video data for visualization purposes.
@@ -1787,6 +2270,19 @@ def video_to_trajectory(
             position/scale/depth/transparency tensors for nonlinear probe fitting.
         return_nonlinear_probe_payload: If True, return the structured nonlinear
             probe payload instead of the standard coordinate array.
+        respect_max_batches_for_extraction: If True, keep max_batches as an
+            active limiter even when extract_coordinates=True. Intended for
+            lightweight monitoring paths rather than full evaluation runs.
+        prob_encoder_route: Optional probabilistic encoder source:
+            'none' keeps the standard DDLP extraction path.
+            'c1' and 'c1-dyn-attrs' load probabilistic encoder checkpoints and
+            reconstruct the recentering-biased C1-family mean using
+            prob_encoder_frozen_model.
+        prob_encoder_frozen_model: Frozen base DDLP model required for
+            prob_encoder_route in {'c1', 'c1-dyn-attrs'}.
+        raw_physical_npz_root: Optional synchronized NPZ root containing raw
+            physical trajectories. Use 'auto' to infer it from the DDLP HDF5
+            root by replacing *_hdf5 with *_npz. Use 'none' to disable.
 
     returns:
         If extract_coordinates=True, returns a numpy array of shape [V, T, N, 2] containing predicted coordinates for all videos in the evaluated set. Otherwise, returns None.
@@ -1795,6 +2291,13 @@ def video_to_trajectory(
     # Validate extraction/reordering and latent recentering options
     if extraction_method not in ['bbox', 'latent']:
         raise ValueError(f"extraction_method must be 'bbox' or 'latent', got '{extraction_method}'")
+    prob_encoder_route = _normalize_prob_encoder_route(prob_encoder_route)
+    if prob_encoder_route != 'none' and extraction_method != 'latent':
+        raise ValueError("prob_encoder_route requires extraction_method='latent'.")
+    if prob_encoder_route in ['c1', 'c1-dyn-attrs'] and prob_encoder_frozen_model is None:
+        raise ValueError(
+            "prob_encoder_route in {'c1','c1-dyn-attrs'} requires prob_encoder_frozen_model."
+        )
     if reorder_method not in ['smallest_consecutive_distance', 'hungarian']:
         raise ValueError(
             f"reorder_method must be either 'smallest_consecutive_distance' or 'hungarian', got '{reorder_method}'"
@@ -1842,6 +2345,7 @@ def video_to_trajectory(
     print(f"\nUsing extraction method: {extraction_method.upper()}")
     if extraction_method == 'latent':
         print("  → Extracting continuous positions from latent space (kp_range coordinates)")
+        print("  → Converting GT from pixel [x,y] to DDLP latent [y,x] coordinates")
         print("  → No Savitzky-Golay smoothing applied (preserves model dynamics)")
         print(f"  → Latent position variant: {latent_position_variant}")
         print(f"  → Recenter source: {latent_recenter_source}")
@@ -1895,9 +2399,16 @@ def video_to_trajectory(
     if noisy_gt_reference_only:
         # GT-only noisy-reference mode does not use extraction; keep user-provided limit.
         effective_max_batches = max_batches
+    elif extract_coordinates and respect_max_batches_for_extraction:
+        effective_max_batches = max_batches
     else:
         effective_max_batches = None if extract_coordinates else max_batches
-    if extract_coordinates and max_batches is not None and not noisy_gt_reference_only:
+    if (
+        extract_coordinates
+        and max_batches is not None
+        and not noisy_gt_reference_only
+        and not respect_max_batches_for_extraction
+    ):
         print(f"extract_coordinates=True: ignoring max_batches={max_batches} and processing all batches.")
     if noisy_gt_noise_alphas is None:
         noisy_gt_noise_alphas = [0.05, 0.1, 0.3, 0.5, 0.7]
@@ -1931,6 +2442,37 @@ def video_to_trajectory(
         dataset, shuffle=False, batch_size=batch_size, 
         num_workers=4, drop_last=False
     )
+    gt_conversion_kp_range = getattr(model, "kp_range", config.get("kp_range", (-1, 1)))
+
+    raw_physical_npz_root_resolved = None
+    raw_physical_cache = {}
+    raw_physical_unavailable_reason = None
+    collect_raw_physical_targets = bool(
+        extraction_method == 'latent'
+        and evaluate_latent_alignment
+        and ds == 'twobody'
+        and str(raw_physical_npz_root).strip().lower() not in {'none', 'off', 'false', '0', ''}
+    )
+    if collect_raw_physical_targets:
+        raw_physical_npz_root_resolved = _resolve_twobody_physical_npz_root(
+            root,
+            raw_physical_npz_root=raw_physical_npz_root,
+        )
+        if raw_physical_npz_root_resolved is None:
+            collect_raw_physical_targets = False
+            raw_physical_unavailable_reason = (
+                f"could not resolve synchronized raw-physics NPZ root from dataset root {root!r}"
+            )
+            print(f"[WARN] Raw physical latent-alignment metrics disabled: {raw_physical_unavailable_reason}")
+        elif not _looks_like_twobody_physical_npz_root(raw_physical_npz_root_resolved):
+            collect_raw_physical_targets = False
+            raw_physical_unavailable_reason = (
+                f"resolved path does not look like a two-body raw-physics NPZ root: "
+                f"{raw_physical_npz_root_resolved}"
+            )
+            print(f"[WARN] Raw physical latent-alignment metrics disabled: {raw_physical_unavailable_reason}")
+        else:
+            print(f"Raw physical latent-alignment target root: {raw_physical_npz_root_resolved}")
 
     if noisy_gt_reference_only:
         print(
@@ -1950,6 +2492,14 @@ def video_to_trajectory(
                 gt_batch = gt_batch.detach().cpu().numpy()
             else:
                 gt_batch = np.asarray(gt_batch)
+            if extraction_method == 'latent':
+                img_batch = batch[0]
+                gt_batch = _convert_gt_xy_pixels_to_latent_yx(
+                    gt_batch,
+                    image_height=int(img_batch.shape[-2]),
+                    image_width=int(img_batch.shape[-1]),
+                    kp_range=gt_conversion_kp_range,
+                )
             gt_only_batches.append(gt_batch)
 
         if len(gt_only_batches) == 0:
@@ -1986,6 +2536,7 @@ def video_to_trajectory(
     model.eval()
     kp_range = model.kp_range
     iou_thresh = config['iou_thresh']
+    topk = int(min(config.get('topk', model.n_kp_enc), model.n_kp_enc))
 
     # latent evaluation output directories
     if evaluate_latent_alignment and latent_eval_save_dir is not None:
@@ -2012,6 +2563,7 @@ def video_to_trajectory(
     all_coordinates_smoothed = []  # To store smoothed predicted coordinates for all videos in the batch for trajectory plotting
     all_coordinates_recentered = []  # secondary coordinates for latent_position_variant='both'
     gt_coordinates = []  # To store ground-truth coordinates for latent alignment evaluation
+    gt_raw_physical_coordinates = []  # Raw physical GT in [y,x] order for optional latent alignment metrics
     all_frame_mse_per_video = []  # frame-wise reconstruction MSE, list of [T]
     nonlinear_probe_nominal = {"p": [], "s": [], "d": [], "tau": [], "feat": []}
     nonlinear_probe_recentered = {"p": [], "s": [], "d": [], "tau": [], "feat": []}
@@ -2112,8 +2664,134 @@ def video_to_trajectory(
         plt.savefig(diagnostic_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"  [Latent Diagnostic] Saved: {diagnostic_path}")
+
+    def _save_latent_training_style_block(
+        output_dir,
+        diagnostic_tag,
+        batch_idx,
+        video_idx,
+        anchor_t,
+        frame_indices,
+        x_batch,
+        mu_plot_batch,
+        kp_prior_batch,
+        rec_batch,
+        mu_tot_batch,
+        logvar_tot_batch,
+        obj_on_batch,
+        mu_scale_batch,
+        alpha_masks_batch,
+        dec_objects_batch,
+        bg_batch,
+    ):
+        # Match train_ddlp.py panel grid style (saved via torchvision.utils.save_image).
+        block_max_imgs = min(8, len(frame_indices))
+        if block_max_imgs < 1:
+            return
+
+        try:
+            sel_t = frame_indices[:block_max_imgs]
+            idx_tensor = torch.as_tensor(sel_t, dtype=torch.long, device=x_batch.device)
+
+            x_sel = x_batch.index_select(0, idx_tensor)
+            mu_plot_sel = mu_plot_batch.index_select(0, idx_tensor)
+            kp_prior_sel = kp_prior_batch.index_select(0, idx_tensor)
+            rec_sel = rec_batch.index_select(0, idx_tensor)
+            mu_tot_sel = mu_tot_batch.index_select(0, idx_tensor)
+            logvar_tot_sel = logvar_tot_batch.index_select(0, idx_tensor)
+            obj_on_sel = obj_on_batch.index_select(0, idx_tensor)
+            mu_scale_sel = mu_scale_batch.index_select(0, idx_tensor)
+            alpha_masks_sel = alpha_masks_batch.index_select(0, idx_tensor)
+            dec_objects_sel = dec_objects_batch.index_select(0, idx_tensor)
+            bg_sel = bg_batch.index_select(0, idx_tensor)
+
+            img_with_kp = plot_keypoints_on_image_batch(
+                mu_plot_sel,
+                x_sel,
+                radius=3,
+                thickness=1,
+                max_imgs=block_max_imgs,
+                kp_range=kp_range,
+            )
+            img_with_kp_p = plot_keypoints_on_image_batch(
+                kp_prior_sel,
+                x_sel,
+                radius=3,
+                thickness=1,
+                max_imgs=block_max_imgs,
+                kp_range=kp_range,
+            )
+
+            with torch.no_grad():
+                logvar_sum = logvar_tot_sel.sum(-1) * obj_on_sel
+                bb_scores = -1 * logvar_sum
+                k_top = max(1, min(topk, int(mu_tot_sel.shape[1])))
+                logvar_topk = torch.topk(logvar_sum, k=k_top, dim=-1, largest=False)
+                topk_indices = logvar_topk[1]
+                batch_indices = torch.arange(mu_tot_sel.shape[0], device=mu_tot_sel.device).view(-1, 1)
+                topk_kp = mu_tot_sel[batch_indices, topk_indices]
+
+            img_with_masks_nms, _ = plot_bb_on_image_batch_from_z_scale_nms(
+                mu_plot_sel,
+                mu_scale_sel,
+                x_sel,
+                scores=bb_scores,
+                iou_thresh=iou_thresh,
+                thickness=1,
+                max_imgs=block_max_imgs,
+                hard_thresh=None,
+            )
+            alpha_masks_binary = torch.where(alpha_masks_sel < 0.05, 0.0, 1.0)
+            img_with_masks_alpha_nms, _ = plot_bb_on_image_batch_from_masks_nms(
+                alpha_masks_binary,
+                x_sel,
+                scores=bb_scores,
+                iou_thresh=iou_thresh,
+                thickness=1,
+                max_imgs=block_max_imgs,
+                hard_thresh=None,
+            )
+            img_with_kp_topk = plot_keypoints_on_image_batch(
+                topk_kp.clamp(min=kp_range[0], max=kp_range[1]),
+                x_sel,
+                radius=3,
+                thickness=1,
+                max_imgs=block_max_imgs,
+                kp_range=kp_range,
+            )
+
+            block_path = os.path.join(
+                output_dir,
+                f"latent_encoding_{diagnostic_tag}_{mode}_batch{batch_idx:03d}_vid{video_idx:03d}_t{anchor_t:03d}_train_style.png",
+            )
+            vutils.save_image(
+                torch.cat(
+                    [
+                        x_sel[:block_max_imgs, -3:],
+                        img_with_kp[:block_max_imgs, -3:].to(x_sel.device),
+                        rec_sel[:block_max_imgs, -3:],
+                        img_with_kp_p[:block_max_imgs, -3:].to(x_sel.device),
+                        img_with_kp_topk[:block_max_imgs, -3:].to(x_sel.device),
+                        dec_objects_sel[:block_max_imgs, -3:],
+                        img_with_masks_nms[:block_max_imgs, -3:].to(x_sel.device),
+                        img_with_masks_alpha_nms[:block_max_imgs, -3:].to(x_sel.device),
+                        bg_sel[:block_max_imgs, -3:],
+                    ],
+                    dim=0,
+                ).data.cpu(),
+                block_path,
+                nrow=block_max_imgs,
+                pad_value=1,
+            )
+            print(f"  [Latent Diagnostic] Saved train-style block: {block_path}")
+        except Exception as e:
+            print(
+                f"  [WARN] Could not save train-style diagnostic block for video {video_idx} "
+                f"(batch={batch_idx}, t={anchor_t}): {e}"
+            )
     
     # iterate over all batches in the dataloader
+    num_batches_processed = 0
     pbar = tqdm(dataloader, desc=f"Evaluating {mode} set")
     for batch_idx, batch in enumerate(pbar):
 
@@ -2121,121 +2799,22 @@ def video_to_trajectory(
         if effective_max_batches is not None and batch_idx >= effective_max_batches:
             print(f"Reached max_batches={effective_max_batches}, stopping evaluation.")
             break
+        num_batches_processed += 1
         
         # Unpack batch
         x = batch[0].to(device)  # Images: [B, T, C, H, W]
         
         # Forward pass with temporal tracking
         with torch.no_grad():
-            
-            # set T and timestep_horizon for autoregressive encoding
-            T = x.shape[1]
-            timestep_horizon = config['timestep_horizon']
-            
-            # Check if autoregressive encoding is needed
-            if T > timestep_horizon:
-                # AUTOREGRESSIVE ENCODING WITH CONTINUATION STATE
-                print(f"Autoregressive encoding: {T} frames in chunks of {timestep_horizon}")
-                
-                all_outputs = []
-                continuation_state = None
-                
-                for chunk_start in range(0, T, timestep_horizon):
-
-                    print("" + "="*60)
-                    print(f"  Processing chunk: frames {chunk_start} to {min(chunk_start + timestep_horizon, T)-1}")
-                    print("" + "="*60)
-
-                    chunk_end = min(chunk_start + timestep_horizon, T)
-                    x_chunk = x[:, chunk_start:chunk_end]  # (B, chunk_len, C, H, W)
-                    assert x_chunk.shape[1] == timestep_horizon, (
-                        f"Autoregressive chunk merge requires fixed chunk length equal to timestep_horizon. "
-                        f"Got chunk_len={x_chunk.shape[1]} vs timestep_horizon={timestep_horizon}. "
-                        f"Use eval_seq_len as a multiple of timestep_horizon."
-                    )
-                    
-                    # Use previous chunk's last frame as conditioning if available
-                    if chunk_start == 0:
-                        x_prior_chunk = x_chunk
-                    else:
-                        # Use last frame from previous chunk as prior
-                        x_prior_chunk = torch.cat(
-                            [x[:, chunk_start-1:chunk_start], 
-                             x_chunk[:, :-1]], 
-                        dim=1)
-                    
-                    # Pass continuation state from previous chunk (None for first chunk)
-                    chunk_output = model(
-                        x_chunk.contiguous(), 
-                        x_prior=x_prior_chunk.contiguous(), 
-                        deterministic=True, 
-                        forward_dyn=True,
-                        continuation_state=continuation_state
-                    )
-                    all_outputs.append(chunk_output)
-                    
-                    # Extract continuation state for next chunk
-                    continuation_state = chunk_output['continuation_state']
-                
-                # Concatenate outputs from all chunks
-                # Each chunk output has shape [B*chunk_T, n_kp, ...] 
-                # We need to reshape to [B, T, n_kp, ...] correctly
-                num_chunks = len(all_outputs)
-                B = x.shape[0]
-                chunk_T = timestep_horizon
-                
-                def reshape_chunk_outputs(outputs_list, example_shape):
-                    """Reshape list of [B*chunk_T, ...] to [B, total_T, ...]"""
-                    # Stack along new dimension: [num_chunks, B*chunk_T, ...]
-                    stacked = torch.stack(outputs_list, dim=0)
-                    # Reshape each chunk: [num_chunks, B, chunk_T, ...]
-                    remaining_dims = stacked.shape[2:]
-                    stacked = stacked.view(num_chunks, B, chunk_T, *remaining_dims)
-                    # Transpose and flatten: [B, num_chunks, chunk_T, ...] -> [B, total_T, ...]
-                    stacked = stacked.transpose(0, 1).contiguous()
-                    total_T = num_chunks * chunk_T
-                    return stacked.view(B, total_T, *remaining_dims)
-                
-                model_output = {
-                    'z_base': reshape_chunk_outputs([out['z_base'] for out in all_outputs], all_outputs[0]['z_base'].shape),
-                    'z': reshape_chunk_outputs([out['z'] for out in all_outputs], all_outputs[0]['z'].shape),
-                    'mu_offset': reshape_chunk_outputs([out['mu_offset'] for out in all_outputs], all_outputs[0]['mu_offset'].shape),
-                    'logvar_offset': reshape_chunk_outputs([out['logvar_offset'] for out in all_outputs], all_outputs[0]['logvar_offset'].shape),
-                    'mu_depth': reshape_chunk_outputs([out['mu_depth'] for out in all_outputs], all_outputs[0]['mu_depth'].shape),
-                    'z_depth': reshape_chunk_outputs([out['z_depth'] for out in all_outputs], all_outputs[0]['z_depth'].shape),
-                    'mu_scale': reshape_chunk_outputs([out['mu_scale'] for out in all_outputs], all_outputs[0]['mu_scale'].shape),
-                    'z_scale': reshape_chunk_outputs([out['z_scale'] for out in all_outputs], all_outputs[0]['z_scale'].shape),
-                    'obj_on': reshape_chunk_outputs([out['obj_on'] for out in all_outputs], all_outputs[0]['obj_on'].shape),
-                    'z_features': reshape_chunk_outputs([out['z_features'] for out in all_outputs], all_outputs[0]['z_features'].shape),
-                    'z_bg': reshape_chunk_outputs([out['z_bg'] for out in all_outputs], all_outputs[0]['z_bg'].shape),
-                    'alpha_masks': reshape_chunk_outputs([out['alpha_masks'] for out in all_outputs], all_outputs[0]['alpha_masks'].shape),
-                    'dec_objects_original': reshape_chunk_outputs([out['dec_objects_original'] for out in all_outputs], all_outputs[0]['dec_objects_original'].shape),
-                    'rec': reshape_chunk_outputs([out['rec'] for out in all_outputs], all_outputs[0]['rec'].shape),
-                }
-            else:
-                # STANDARD ENCODING: Single forward pass for sequences <= timestep_horizon
-                model_output = model(x, x_prior=x, deterministic=True, forward_dyn=True)
-                
-                # Reshape outputs from [B*T, n_kp, ...] to [B, T, n_kp, ...]
-                B = x.shape[0]
-                T = x.shape[1]
-                
-                model_output = {
-                    'z_base': model_output['z_base'].view(B, T, model.n_kp_enc, 2),
-                    'z': model_output['z'].view(B, T, model.n_kp_enc, 2),
-                    'mu_offset': model_output['mu_offset'].view(B, T, model.n_kp_enc, 2),
-                    'logvar_offset': model_output['logvar_offset'].view(B, T, model.n_kp_enc, 2),
-                    'mu_depth': model_output['mu_depth'].view(B, T, model.n_kp_enc, 1),
-                    'z_depth': model_output['z_depth'].view(B, T, model.n_kp_enc, 1),
-                    'mu_scale': model_output['mu_scale'].view(B, T, model.n_kp_enc, 2),
-                    'z_scale': model_output['z_scale'].view(B, T, model.n_kp_enc, 2),
-                    'obj_on': model_output['obj_on'].view(B, T, model.n_kp_enc),
-                    'z_features': model_output['z_features'].view(B, T, model.n_kp_enc, -1),
-                    'z_bg': model_output['z_bg'].view(B, T, -1),
-                    'alpha_masks': model_output['alpha_masks'].view(B, T, model.n_kp_enc, 1, x.shape[3], x.shape[4]),
-                    'dec_objects_original': model_output['dec_objects_original'].view(B, T, model.n_kp_enc, *model_output['dec_objects_original'].shape[2:]),
-                    'rec': model_output['rec'].view(B, T, x.shape[2], x.shape[3], x.shape[4]),
-                }
+            model_output = _encode_sequence_model(model, x, config, label="prob_encoder" if prob_encoder_route != 'none' else "ddlp")
+            frozen_model_output = None
+            if prob_encoder_route in {'c1', 'c1-dyn-attrs'}:
+                frozen_model_output = _encode_sequence_model(
+                    prob_encoder_frozen_model,
+                    x,
+                    config,
+                    label="frozen_ddlp",
+                )
         
             # Now model_output has consistent shape [B, T, n_kp, ...] for both paths
             T = model_output['z_base'].shape[1]  # Get T from reshaped output
@@ -2249,13 +2828,27 @@ def video_to_trajectory(
             z_depth = model_output['z_depth']  # [bs, T, n_kp, 1]
             mu_scale = model_output['mu_scale']  # [bs, T, n_kp, 2]
             z_scale = model_output['z_scale']  # [bs, T, n_kp, 2]
+            kp_p = model_output['kp_p']  # [bs, T, n_kp, 2]
             obj_on = model_output['obj_on']  # [bs, T, n_kp]
             z_bg = model_output['z_bg']  # [bs, T, bg_dim]
             alpha_masks = model_output['alpha_masks']  # [bs, T, n_kp, 1, h, w]
             dec_objects_original = model_output['dec_objects_original']  # [bs, T, n_kp, 4, h_patch, w_patch]
+            dec_objects_batch = model_output['dec_objects']  # [bs, T, C, H, W]
+            bg_batch = model_output['bg']  # [bs, T, C, H, W]
             rec_batch = model_output['rec']  # [bs, T, C, H, W]
 
-            mu_tot_nominal = z_base + mu_offset
+            if prob_encoder_route == 'none':
+                mu_tot_nominal = z_base + mu_offset
+                prob_encoder_valid_mask = None
+            else:
+                mu_tot_nominal, prob_encoder_valid_mask = _build_prob_encoder_route_mean(
+                    route=prob_encoder_route,
+                    train_out=model_output,
+                    frozen_out=frozen_model_output,
+                    latent_recenter_source=latent_recenter_source,
+                    latent_recenter_eps=latent_recenter_eps,
+                    kp_range=kp_range,
+                )
             mu_tot_recentered = None
             recenter_valid_mask = None
             if compute_recentered_latents:
@@ -2273,6 +2866,8 @@ def video_to_trajectory(
                         eps=latent_recenter_eps,
                     )
                 mu_tot_recentered = mu_tot_recentered.clamp(min=kp_range[0], max=kp_range[1])
+            if recenter_valid_mask is None and prob_encoder_valid_mask is not None:
+                recenter_valid_mask = prob_encoder_valid_mask
 
             mu_tot = mu_tot_nominal
             logvar_tot = logvar_offset
@@ -2302,6 +2897,7 @@ def video_to_trajectory(
             batch_coordinates = []
             batch_coordinates_recentered = []
             batch_gt_coordinates = []
+            batch_gt_raw_physical_coordinates = []
             batch_latent_scale_raw = []
             batch_latent_depth_raw = []
             batch_latent_tau_raw = []
@@ -2374,6 +2970,25 @@ def video_to_trajectory(
                             obj_on_batch=obj_on[video_idx],
                             z_depth_batch=z_depth[video_idx],
                             z_scale_batch=z_scale[video_idx],
+                        )
+                        _save_latent_training_style_block(
+                            output_dir=latent_failure_dir,
+                            diagnostic_tag="failure",
+                            batch_idx=batch_idx,
+                            video_idx=video_idx,
+                            anchor_t=failure_time,
+                            frame_indices=frame_indices,
+                            x_batch=x[video_idx],
+                            mu_plot_batch=kp_batch[video_idx],
+                            kp_prior_batch=kp_p[video_idx],
+                            rec_batch=rec_batch[video_idx],
+                            mu_tot_batch=mu_tot[video_idx],
+                            logvar_tot_batch=logvar_tot[video_idx],
+                            obj_on_batch=obj_on[video_idx],
+                            mu_scale_batch=mu_scale[video_idx],
+                            alpha_masks_batch=alpha_masks[video_idx],
+                            dec_objects_batch=dec_objects_batch[video_idx],
+                            bg_batch=bg_batch[video_idx],
                         )
                         num_failed_videos_plotted += 1
                     elif (
@@ -2500,7 +3115,48 @@ def video_to_trajectory(
                             valid_sel = recenter_valid_mask[video_idx, :, filtered_indices].float()
                             recenter_valid_fractions.append(float(valid_sel.mean().item()))
 
-                    batch_gt_coordinates.append(batch[1][video_idx].cpu().numpy())  # [T, n_objects, 2]
+                    gt_xy_pixels = batch[1][video_idx].cpu().numpy()  # [T, n_objects, 2] in dataset [x,y] pixels
+                    gt_latent_yx = _convert_gt_xy_pixels_to_latent_yx(
+                        gt_xy_pixels,
+                        image_height=int(x.shape[-2]),
+                        image_width=int(x.shape[-1]),
+                        kp_range=kp_range,
+                    )
+                    batch_gt_coordinates.append(gt_latent_yx)  # [T, n_objects, 2] in DDLP latent [y,x]
+
+                    if collect_raw_physical_targets:
+                        dataset_item_idx = batch_idx * batch_size + video_idx
+                        gt_raw_physical_yx, raw_reason = _load_twobody_raw_physical_yx_sequence(
+                            raw_physical_npz_root_resolved,
+                            dataset,
+                            dataset_item_idx,
+                            expected_T=gt_latent_yx.shape[0],
+                            cache=raw_physical_cache,
+                        )
+                        if gt_raw_physical_yx is None:
+                            collect_raw_physical_targets = False
+                            gt_raw_physical_coordinates = []
+                            batch_gt_raw_physical_coordinates = []
+                            raw_physical_unavailable_reason = raw_reason
+                            print(
+                                "[WARN] Raw physical latent-alignment metrics disabled: "
+                                f"{raw_physical_unavailable_reason}"
+                            )
+                        elif gt_raw_physical_yx.shape != gt_latent_yx.shape:
+                            collect_raw_physical_targets = False
+                            gt_raw_physical_coordinates = []
+                            batch_gt_raw_physical_coordinates = []
+                            raw_physical_unavailable_reason = (
+                                f"raw physical shape {gt_raw_physical_yx.shape} does not match "
+                                f"image-space GT shape {gt_latent_yx.shape}"
+                            )
+                            print(
+                                "[WARN] Raw physical latent-alignment metrics disabled: "
+                                f"{raw_physical_unavailable_reason}"
+                            )
+                        else:
+                            batch_gt_raw_physical_coordinates.append(gt_raw_physical_yx)
+
                     kept_trajectories += 1
                     if evaluate_latent_alignment and frame_mse_batch is not None:
                         all_frame_mse_per_video.append(frame_mse_batch[video_idx])
@@ -2808,6 +3464,20 @@ def video_to_trajectory(
             # if evaluating latent alignment, also store the ground-truth coordinates for this batch for later comparison with predicted coordinates in latent space
             if needs_alignment_targets:
                 gt_coordinates.append(batch_gt_coordinates)  # list of [B, T, n_kp, 2] np arrays for each batch    
+                if collect_raw_physical_targets:
+                    if len(batch_gt_raw_physical_coordinates) == len(batch_gt_coordinates):
+                        gt_raw_physical_coordinates.append(batch_gt_raw_physical_coordinates)
+                    else:
+                        collect_raw_physical_targets = False
+                        gt_raw_physical_coordinates = []
+                        raw_physical_unavailable_reason = (
+                            "raw physical target count did not match kept image-space target count "
+                            f"for batch {batch_idx}"
+                        )
+                        print(
+                            "[WARN] Raw physical latent-alignment metrics disabled: "
+                            f"{raw_physical_unavailable_reason}"
+                        )
 
             # plot trajectories of predicted coordinates for this batch of videos
             # Skip smoothing comparison plots for latent extraction
@@ -2982,6 +3652,8 @@ def video_to_trajectory(
         print(f"\nExtracted predicted coordinates for {all_coordinates.shape[0]} videos with shape: {all_coordinates.shape}")
     
     gt_coordinates_ = None
+    gt_raw_physical_coordinates_ = None
+    raw_physical_gt_metadata = None
     if needs_alignment_targets:
         if len(gt_coordinates) == 0:
             raise ValueError(
@@ -2989,6 +3661,30 @@ def video_to_trajectory(
                 f"(mode={mode}). All trajectories were filtered out."
             )
         gt_coordinates_ = np.concatenate(gt_coordinates, axis=0)  # [total_videos, T, n_kp, 2]
+        if collect_raw_physical_targets and len(gt_raw_physical_coordinates) > 0:
+            gt_raw_physical_coordinates_ = np.concatenate(gt_raw_physical_coordinates, axis=0)
+            if gt_raw_physical_coordinates_.shape != gt_coordinates_.shape:
+                print(
+                    "[WARN] Raw physical latent-alignment metrics disabled: "
+                    f"raw shape {gt_raw_physical_coordinates_.shape} does not match "
+                    f"image-space GT shape {gt_coordinates_.shape}."
+                )
+                gt_raw_physical_coordinates_ = None
+            else:
+                raw_physical_gt_metadata = {
+                    "source": "synchronized_twobody_npz",
+                    "npz_root": raw_physical_npz_root_resolved,
+                    "coordinate_order": "yx",
+                    "coordinate_units": "raw_physical",
+                    "num_videos": int(gt_raw_physical_coordinates_.shape[0]),
+                    "T": int(gt_raw_physical_coordinates_.shape[1]),
+                    "N": int(gt_raw_physical_coordinates_.shape[2]),
+                }
+        elif raw_physical_unavailable_reason is not None:
+            raw_physical_gt_metadata = {
+                "source": "unavailable",
+                "reason": raw_physical_unavailable_reason,
+            }
 
     if return_nonlinear_probe_payload:
         if nonlinear_probe_payload is None or gt_coordinates_ is None:
@@ -2999,6 +3695,9 @@ def video_to_trajectory(
         nonlinear_probe_payload["nominal"]["gt"] = gt_coordinates_
         if "recentered" in nonlinear_probe_payload:
             nonlinear_probe_payload["recentered"]["gt"] = gt_coordinates_
+        nonlinear_probe_payload["num_batches_processed"] = int(num_batches_processed)
+        nonlinear_probe_payload["num_videos_kept"] = int(gt_coordinates_.shape[0])
+        nonlinear_probe_payload["num_videos_seen"] = int(total_trajectories_seen)
         return nonlinear_probe_payload
 
     if evaluate_latent_alignment:
@@ -3049,6 +3748,8 @@ def video_to_trajectory(
                     all_coordinates_smoothed,
                     gt_coordinates_,
                     save_dir=None,
+                    raw_physical_gt_coordinates=gt_raw_physical_coordinates_,
+                    raw_physical_gt_metadata=raw_physical_gt_metadata,
                     metrics_filename_extra_parts=['variant_nominal'],
                     extra_metadata={
                         'latent_position_variant': 'nominal',
@@ -3062,6 +3763,8 @@ def video_to_trajectory(
                     all_coordinates_recentered_agg,
                     gt_coordinates_,
                     save_dir=None,
+                    raw_physical_gt_coordinates=gt_raw_physical_coordinates_,
+                    raw_physical_gt_metadata=raw_physical_gt_metadata,
                     metrics_filename_extra_parts=[
                         'variant_recentered',
                         f'source_{latent_recenter_source}',
@@ -3093,6 +3796,17 @@ def video_to_trajectory(
                         'latent_recenter_source': latent_recenter_source,
                         'latent_recenter_nms_source': latent_recenter_nms_source,
                         'latent_recenter_eps': float(latent_recenter_eps),
+                        'metric_definitions': {
+                            'velocity': 'first temporal difference q[t+1] - q[t]',
+                            'discrete_acceleration': (
+                                'second temporal difference q[t+2] - 2*q[t+1] + q[t]; '
+                                'the common dt^-2 factor is omitted'
+                            ),
+                            'smoothness_ratio_acc_rms': (
+                                'RMS discrete acceleration of the aligned prediction divided by '
+                                'RMS discrete acceleration of the target'
+                            ),
+                        },
                         'nominal': nominal_metrics,
                         'recentered': recentered_metrics,
                     }
@@ -3108,6 +3822,8 @@ def video_to_trajectory(
                     evaluate_latent_alignment_metrics(
                         all_coordinates_smoothed,
                         gt_coordinates_,
+                        raw_physical_gt_coordinates=gt_raw_physical_coordinates_,
+                        raw_physical_gt_metadata=raw_physical_gt_metadata,
                         extra_metadata={
                             'latent_position_variant': 'nominal',
                             'latent_recenter_source': latent_recenter_source,
@@ -3120,6 +3836,8 @@ def video_to_trajectory(
                     evaluate_latent_alignment_metrics(
                         all_coordinates_smoothed,
                         gt_coordinates_,
+                        raw_physical_gt_coordinates=gt_raw_physical_coordinates_,
+                        raw_physical_gt_metadata=raw_physical_gt_metadata,
                         metrics_filename_extra_parts=[
                             'variant_recentered',
                             f'source_{latent_recenter_source}',
@@ -3146,6 +3864,8 @@ def video_to_trajectory(
                 extraction_method=extraction_method,
                 use_hungarian_for_correlation=use_hungarian_for_correlation,
                 reorder_method=reorder_method,
+                raw_physical_gt_coordinates=gt_raw_physical_coordinates_,
+                raw_physical_gt_metadata=raw_physical_gt_metadata,
             )
 
             pred_coordinates = all_coordinates
@@ -3158,6 +3878,8 @@ def video_to_trajectory(
                 extraction_method=extraction_method,
                 use_hungarian_for_correlation=use_hungarian_for_correlation,
                 reorder_method=reorder_method,
+                raw_physical_gt_coordinates=gt_raw_physical_coordinates_,
+                raw_physical_gt_metadata=raw_physical_gt_metadata,
             )
 
     if evaluate_noisy_gt_reference:
@@ -3419,6 +4141,12 @@ def save_trajectories_to_GHNN_format(
     latent_recenter_source='patch_alpha',
     latent_recenter_nms_source='nominal',
     latent_recenter_eps=1e-6,
+    prob_encoder_route='none',
+    prob_encoder_frozen_model=None,
+    write_prob_encoder_alignment_metrics=False,
+    alignment_split='test',
+    latent_eval_save_dir=None,
+    use_hungarian_for_correlation=False,
 ):
     """
     Extract trajectories from DDLP model for all splits and save in GHNN format.
@@ -3448,10 +4176,22 @@ def save_trajectories_to_GHNN_format(
         smooth_momentum: Whether to apply Savitzky-Golay smoothing to momentum (default: False)
         extraction_method: Method for trajectory extraction ('bbox' or 'latent')
         filtering_report_path: Path to filtering report JSON shared across split extraction.
+        prob_encoder_route: Optional probabilistic encoder route identifier
+            in {'none', 'c1', 'c1-dyn-attrs'}.
+        prob_encoder_frozen_model: Frozen base DDLP model required when
+            prob_encoder_route is not 'none'.
+        write_prob_encoder_alignment_metrics: Whether to run an alignment-metric pass
+            after HDF5 export.
+        alignment_split: Split used by the optional alignment-metric pass.
+        latent_eval_save_dir: Directory for optional alignment metrics.
+        use_hungarian_for_correlation: Whether to apply supervised Hungarian
+            matching in the optional alignment-metric pass.
     
     Returns:
         Dictionary with paths to generated files and statistics
     """
+    prob_encoder_route = _normalize_prob_encoder_route(prob_encoder_route)
+
     print("\n" + "="*80)
     print("EXTRACTING DDLP TRAJECTORIES AND CONVERTING TO GHNN FORMAT")
     print("="*80)
@@ -3508,6 +4248,8 @@ def save_trajectories_to_GHNN_format(
                 latent_recenter_source=latent_recenter_source,
                 latent_recenter_nms_source=latent_recenter_nms_source,
                 latent_recenter_eps=latent_recenter_eps,
+                prob_encoder_route=prob_encoder_route,
+                prob_encoder_frozen_model=prob_encoder_frozen_model,
             )
             
             if trajectories is not None and trajectories.shape[0] > 0:
@@ -3547,6 +4289,50 @@ def save_trajectories_to_GHNN_format(
         train_seq_len=train_seq_len,
         eval_seq_len=eval_seq_len,
     )
+
+    if write_prob_encoder_alignment_metrics:
+        if prob_encoder_route == 'none':
+            print("[WARN] Requested probabilistic encoder alignment metrics without a probabilistic encoder route.")
+        else:
+            alignment_mode = alignment_split
+            alignment_seq_len = train_seq_len if alignment_mode == 'train' else eval_seq_len
+            alignment_save_dir = None
+            if latent_eval_save_dir is not None:
+                alignment_save_dir = os.path.join(
+                    latent_eval_save_dir,
+                    _prob_encoder_output_dirname(prob_encoder_route),
+                )
+                os.makedirs(alignment_save_dir, exist_ok=True)
+            print("\n" + "="*80)
+            print(f"RUNNING PROBABILISTIC ENCODER ALIGNMENT METRICS ({alignment_mode.upper()})")
+            print("="*80)
+            video_to_trajectory(
+                model=model,
+                config=config,
+                device=device,
+                mode=alignment_mode,
+                batch_size=batch_size,
+                max_batches=None,
+                eval_seq_len=alignment_seq_len,
+                save_dir=None,
+                latent_eval_save_dir=alignment_save_dir,
+                visualize_trajectories=False,
+                extract_coordinates=True,
+                returns=False,
+                evaluate_latent_alignment=True,
+                use_hungarian_for_correlation=use_hungarian_for_correlation,
+                reorder_method='smallest_consecutive_distance',
+                sg_window_length=sg_window_length,
+                sg_polyorder=sg_polyorder,
+                extraction_method=extraction_method,
+                filtering_report_path=None,
+                latent_position_variant=latent_position_variant,
+                latent_recenter_source=latent_recenter_source,
+                latent_recenter_nms_source=latent_recenter_nms_source,
+                latent_recenter_eps=latent_recenter_eps,
+                prob_encoder_route=prob_encoder_route,
+                prob_encoder_frozen_model=prob_encoder_frozen_model,
+            )
     
     print("\n Conversion completed successfully!")
     print(f"Output files:")
@@ -3992,6 +4778,23 @@ def main():
                         help="Which latent coordinates drive NMS/filtering in latent extraction")
     parser.add_argument('--latent_recenter_eps', type=float, default=1e-6,
                         help='Numerical epsilon for recentering centroid computations')
+    parser.add_argument('--raw_physical_npz_root', type=str, default='auto',
+                        help=(
+                            "Synchronized raw-physics NPZ root for additional latent-alignment metrics. "
+                            "Use 'auto' to infer from the DDLP HDF5 root, or 'none' to disable."
+                        ))
+    parser.add_argument('--prob_encoder_checkpoint', type=str, default=None,
+                        help='Optional probabilistic encoder checkpoint (C1 family) to use as the latent position source')
+    parser.add_argument('--prob_encoder_route', type=str, default='none',
+                        choices=['none', 'c1', 'c1-dyn-attrs', 'c1_dyn_attrs'],
+                        help="Probabilistic encoder route label: 'c1', 'c1-dyn-attrs', 'c1_dyn_attrs', or 'none'")
+    parser.add_argument('--prob_encoder_output_tag', type=str, default=None,
+                        help='Optional output-directory tag for probabilistic-encoder evaluations (e.g. c1_dyn_full).')
+    parser.add_argument('--write_prob_encoder_alignment_metrics', type=int, default=0,
+                        help='When converting to GHNN, also write alignment metrics for the probabilistic encoder source')
+    parser.add_argument('--alignment_split', type=str, default='test',
+                        choices=['train', 'valid', 'test'],
+                        help='Split for optional probabilistic-encoder alignment metrics')
     parser.add_argument('--nonlinear_train_seq_len', type=int, default=60,
                         help='Sequence length to extract for train split in nonlinear probe evaluation')
     parser.add_argument('--nonlinear_valid_seq_len', type=int, default=360,
@@ -4012,6 +4815,7 @@ def main():
                         help='Random seed for nonlinear MLP probe fitting')
 
     args = parser.parse_args()
+    args.prob_encoder_route = _normalize_prob_encoder_route(args.prob_encoder_route)
 
     # Parse max_batches from string form to int or None
     max_batches_raw = str(args.max_batches).strip().lower()
@@ -4104,6 +4908,18 @@ def main():
             "latent_position_variant='both' is not supported with --convert_to_ghnn=1. "
             "Use 'nominal' or 'recentered'."
         )
+    if args.prob_encoder_route != 'none':
+        if args.prob_encoder_checkpoint is None:
+            raise ValueError("--prob_encoder_checkpoint is required when --prob_encoder_route is not 'none'.")
+        if args.extraction_method != 'latent':
+            raise ValueError("--prob_encoder_route requires --extraction_method latent.")
+        if args.latent_position_variant != 'nominal':
+            raise ValueError(
+                "Probabilistic encoder export emits the selected C1-family mean as the nominal latent stream. "
+                "Use --latent_position_variant nominal."
+            )
+    if args.prob_encoder_route == 'none' and args.prob_encoder_checkpoint is not None:
+        raise ValueError("--prob_encoder_checkpoint was provided but --prob_encoder_route is 'none'.")
     
     # Load configuration
     config_path = os.path.join(args.checkpoint, 'hparams.json')
@@ -4157,11 +4973,17 @@ def main():
     ).to(device)
     
     # Load checkpoint
+    checkpoint_stem = 'twobody_ddlp_minimal_off_cnt'
+    if 'BIG' in args.checkpoint.upper():
+        checkpoint_stem = f"{checkpoint_stem}_BIG"
+
     if args.checkpoint_name is None:
-        checkpoint_path = os.path.join(args.checkpoint, 'saves', 'twobody_ddlp_minimal_off_cnt.pth')
+        checkpoint_path = os.path.join(args.checkpoint, 'saves', f"{checkpoint_stem}.pth")
     else:
         if args.checkpoint_name.lower().find('best') != -1:
-            checkpoint_path = os.path.join(args.checkpoint, 'saves', 'twobody_ddlp_minimal_off_cnt_best_lpips.pth')
+            checkpoint_path = os.path.join(
+                args.checkpoint, 'saves', f"{checkpoint_stem}_best_lpips.pth"
+            )
         else:
             checkpoint_path = os.path.join(args.checkpoint, 'saves', args.checkpoint_name)
     if not os.path.exists(checkpoint_path):
@@ -4188,6 +5010,28 @@ def main():
             print(f"Checkpoint epoch: {checkpoint.get('epoch', 'unknown')}")
     else:
         raise FileNotFoundError(f"Warning: No checkpoint found at {checkpoint_path}")
+
+    prob_encoder_frozen_model = None
+    if args.prob_encoder_route != 'none':
+        if args.prob_encoder_route in {'c1', 'c1-dyn-attrs'}:
+            prob_encoder_frozen_model = deepcopy(model).to(device)
+            prob_encoder_frozen_model.eval()
+            for p in prob_encoder_frozen_model.parameters():
+                p.requires_grad = False
+
+        prob_payload = _load_checkpoint_into_model(
+            model,
+            args.prob_encoder_checkpoint,
+            device=device,
+            strict=True,
+        )
+        model.eval()
+        print(
+            f"Loaded probabilistic encoder ({args.prob_encoder_route}) "
+            f"from {args.prob_encoder_checkpoint}"
+        )
+        if isinstance(prob_payload, dict):
+            print(f"Probabilistic encoder epoch: {prob_payload.get('epoch', 'unknown')}")
         
     # Set unified result directories under checkpoint/extraction_evaluation/{checkpoint_name}
     checkpoint_name_tag = args.checkpoint_name if args.checkpoint_name is not None else "default"
@@ -4208,14 +5052,48 @@ def main():
 
     save_dir = os.path.join(extraction_eval_root, visualizations_dirname)
     latent_eval_save_dir = os.path.join(extraction_eval_root, latent_eval_dirname)
+
+    # Only materialize output directories that this run can actually populate.
+    needs_visualization_dir = bool(args.visualize_trajectories)
+    needs_latent_eval_dir = bool(
+        args.evaluate_latent_alignment
+        or args.evaluate_latent_alignment_nonlinear
+        or args.evaluate_noisy_gt_reference
+        or args.write_prob_encoder_alignment_metrics
+    )
+    active_save_dir = save_dir if needs_visualization_dir else None
+    active_latent_eval_save_dir = latent_eval_save_dir if needs_latent_eval_dir else None
+    direct_prob_encoder_alignment_run = bool(
+        args.evaluate_latent_alignment
+        and not args.convert_to_ghnn
+        and not args.evaluate_latent_alignment_nonlinear
+        and args.prob_encoder_route != 'none'
+    )
+    if direct_prob_encoder_alignment_run and active_latent_eval_save_dir is not None:
+        active_latent_eval_save_dir = os.path.join(
+            active_latent_eval_save_dir,
+            _prob_encoder_output_dirname(
+                args.prob_encoder_route,
+                output_tag=args.prob_encoder_output_tag,
+            ),
+        )
+
     filtering_report_path = None if (bool(args.evaluate_latent_alignment) or bool(args.evaluate_latent_alignment_nonlinear)) else os.path.join(extraction_eval_root, "filtering_report.json")
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(latent_eval_save_dir, exist_ok=True)
+    if active_save_dir is not None:
+        os.makedirs(active_save_dir, exist_ok=True)
+    if active_latent_eval_save_dir is not None:
+        os.makedirs(active_latent_eval_save_dir, exist_ok=True)
     if filtering_report_path is not None and os.path.exists(filtering_report_path):
         os.remove(filtering_report_path)
     print(f"Results root: {extraction_eval_root}")
-    print(f"Visualization outputs: {save_dir}")
-    print(f"Latent-eval outputs: {latent_eval_save_dir}")
+    if active_save_dir is not None:
+        print(f"Visualization outputs: {active_save_dir}")
+    else:
+        print("Visualization outputs: disabled for this run")
+    if active_latent_eval_save_dir is not None:
+        print(f"Latent-eval outputs: {active_latent_eval_save_dir}")
+    else:
+        print("Latent-eval outputs: disabled for this run")
     if filtering_report_path is not None:
         print(f"Filtering report: {filtering_report_path}")
     else:
@@ -4232,8 +5110,8 @@ def main():
             device=device,
             batch_size=args.batch_size,
             max_batches=args.max_batches,
-            save_dir=save_dir,
-            latent_eval_save_dir=latent_eval_save_dir,
+            save_dir=active_save_dir,
+            latent_eval_save_dir=active_latent_eval_save_dir,
             use_hungarian_for_correlation=bool(args.use_hungarian_for_correlation),
             reorder_method=args.reorder_method,
             extraction_method=args.extraction_method,
@@ -4263,13 +5141,12 @@ def main():
 
         ghnn_output_dir = args.ghnn_output_dir
         ghnn_dataset_name = args.ghnn_dataset_name
-        if args.latent_position_variant == 'recentered':
-            if ghnn_output_dir is None:
-                ghnn_output_dir = os.path.join(extraction_eval_root, "ghnn_converted_recentered")
-            if 'recentered' not in ghnn_dataset_name:
-                ghnn_dataset_name = f"{ghnn_dataset_name}_recentered"
-        elif ghnn_output_dir is None:
-            ghnn_output_dir = os.path.join(extraction_eval_root, "ghnn_converted")
+        if ghnn_output_dir is None:
+            # Store all extracted trajectory datasets under a single checkpoint-scoped folder.
+            # Distinguish nominal/recentered variants via dataset_name suffixes.
+            ghnn_output_dir = os.path.join(extraction_eval_root, "extracted_datasets")
+        if args.latent_position_variant == 'recentered' and 'recentered' not in ghnn_dataset_name:
+            ghnn_dataset_name = f"{ghnn_dataset_name}_recentered"
 
         print(f"GHNN output dir: {ghnn_output_dir}")
         print(f"GHNN dataset name: {ghnn_dataset_name}")
@@ -4298,6 +5175,12 @@ def main():
             latent_recenter_source=args.latent_recenter_source,
             latent_recenter_nms_source=args.latent_recenter_nms_source,
             latent_recenter_eps=args.latent_recenter_eps,
+            prob_encoder_route=args.prob_encoder_route,
+            prob_encoder_frozen_model=prob_encoder_frozen_model,
+            write_prob_encoder_alignment_metrics=bool(args.write_prob_encoder_alignment_metrics),
+            alignment_split=args.alignment_split,
+            latent_eval_save_dir=active_latent_eval_save_dir,
+            use_hungarian_for_correlation=bool(args.use_hungarian_for_correlation),
         )
         
         print("\n✅ GHNN conversion completed successfully!")    
@@ -4308,8 +5191,8 @@ def main():
         video_to_trajectory(
             model, config, device=device, mode=args.mode,
             batch_size=args.batch_size, max_batches=args.max_batches,
-            eval_seq_len=eval_seq_len, save_dir=save_dir,
-            latent_eval_save_dir=latent_eval_save_dir,
+            eval_seq_len=eval_seq_len, save_dir=active_save_dir,
+            latent_eval_save_dir=active_latent_eval_save_dir,
             visualize_trajectories=bool(args.visualize_trajectories),
             extract_coordinates=bool(args.extract_coordinates), 
             evaluate_latent_alignment=bool(args.evaluate_latent_alignment),
@@ -4327,6 +5210,9 @@ def main():
             latent_recenter_source=args.latent_recenter_source,
             latent_recenter_nms_source=args.latent_recenter_nms_source,
             latent_recenter_eps=args.latent_recenter_eps,
+            prob_encoder_route=args.prob_encoder_route,
+            prob_encoder_frozen_model=prob_encoder_frozen_model,
+            raw_physical_npz_root=args.raw_physical_npz_root,
         )
 
         print("\n✅ Visualization generation complete!")

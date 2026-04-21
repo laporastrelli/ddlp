@@ -4,7 +4,7 @@ set -euo pipefail
 # -------- user config --------
 REPO_DIR="/data2/users/lr4617/ddlp"
 SCRIPT="${REPO_DIR}/eval/eval_bounding_boxes.py"
-CHECKPOINT="/data2/users/lr4617/ddlp/outputs/290126_164237_twobody_ddlp_minimal_off_cnt"
+CHECKPOINT="/data2/users/lr4617/ddlp/outputs/040426_084653_twobody_ddlp_minimal_off_cnt_BIG"
 CHECKPOINT_NAME="best"
 DEVICE="cuda:0"
 BATCH_SIZE=20

@@ -151,12 +151,33 @@ def train_ddlp(config_path='./configs/balls.json'):
     # accelerate baking
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=scheduler_gamma, verbose=True)
+    train_start_epoch = 0
+    resume_iteration = None
 
     if load_model and pretrained_path is not None:
         try:
+            checkpoint = torch.load(pretrained_path, map_location=accelerator.device)
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.load_state_dict(torch.load(pretrained_path, map_location=accelerator.device))
-            print("loaded model from checkpoint")
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                checkpoint_epoch = checkpoint.get('epoch', -1)
+                if checkpoint_epoch is None:
+                    checkpoint_epoch = -1
+                train_start_epoch = int(checkpoint_epoch) + 1
+                if checkpoint.get('iteration', None) is not None:
+                    resume_iteration = int(checkpoint['iteration'])
+                print(f"loaded complete checkpoint from epoch {checkpoint_epoch}")
+                if resume_iteration is not None:
+                    print(f"resumed iteration={resume_iteration}")
+                else:
+                    print("iteration not found in checkpoint, will infer from epoch count")
+            else:
+                unwrapped_model.load_state_dict(checkpoint)
+                print("loaded model weights from checkpoint (legacy format)")
         except:
             print("model checkpoint not found")
 
@@ -190,9 +211,23 @@ def train_ddlp(config_path='./configs/balls.json'):
     dynamics_warmup_iters = max(warmup_epoch, 1) * max(10_000, iter_per_epoch)
     iter_per_step = dynamics_warmup_iters // timestep_horizon
     max_iterations_per_step = [iter_per_step * (i + 1) for i in range(timestep_horizon)]
-    iteration = 0  # initialize iterations counter
+    if resume_iteration is not None:
+        iteration = resume_iteration
+    else:
+        resumed_dyn_epochs = max(0, train_start_epoch - start_epoch)
+        iteration = resumed_dyn_epochs * iter_per_epoch
 
-    for epoch in range(num_epochs):
+    if train_start_epoch >= num_epochs:
+        accelerator.print(f"checkpoint already reached epoch {train_start_epoch - 1}, "
+                          f"which is >= num_epochs-1 ({num_epochs - 1}). nothing to train.")
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        return unwrapped_model
+
+    if train_start_epoch > 0:
+        accelerator.print(f"resuming loop from epoch {train_start_epoch} with iteration={iteration}")
+
+    for epoch in range(train_start_epoch, num_epochs):
         model.train()
         batch_losses = []
         batch_losses_rec = []
@@ -408,7 +443,14 @@ def train_ddlp(config_path='./configs/balls.json'):
                     torch.cat([cropped_objects_original[:max_imgs * 2, -3:], dec_objects_rgb[:max_imgs * 2, -3:]],
                               dim=0).data.cpu(), '{}/image_obj_{}.jpg'.format(fig_dir, epoch),
                     nrow=8, pad_value=1)
-                accelerator.save(unwrapped_model.state_dict(), os.path.join(save_dir, f'{ds}_ddlp{run_prefix}.pth'))
+                checkpoint = {
+                    'model_state_dict': unwrapped_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'iteration': iteration
+                }
+                accelerator.save(checkpoint, os.path.join(save_dir, f'{ds}_ddlp{run_prefix}.pth'))
             animate_trajectory_ddlp(model.module, config, epoch, device=accelerator.device, fig_dir=fig_dir,
                                     timestep_horizon=animation_horizon, num_trajetories=1,
                                     accelerator=accelerator, train=True, cond_steps=cond_steps)
@@ -432,7 +474,14 @@ def train_ddlp(config_path='./configs/balls.json'):
                     log_line(log_dir, log_str)
                 best_valid_loss = valid_loss
                 best_valid_epoch = epoch
-                accelerator.save(unwrapped_model.state_dict(),
+                checkpoint = {
+                    'model_state_dict': unwrapped_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'epoch': epoch,
+                    'iteration': iteration
+                }
+                accelerator.save(checkpoint,
                                  os.path.join(save_dir, f'{ds}_ddlp{run_prefix}_best.pth'))
             torch.cuda.empty_cache()
             if eval_im_metrics and epoch > 0:
@@ -452,7 +501,14 @@ def train_ddlp(config_path='./configs/balls.json'):
                         log_line(log_dir, log_str)
                         best_val_lpips = val_lpips
                         best_val_lpips_epoch = epoch
-                        accelerator.save(unwrapped_model.state_dict(),
+                        checkpoint = {
+                            'model_state_dict': unwrapped_model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'epoch': epoch,
+                            'iteration': iteration
+                        }
+                        accelerator.save(checkpoint,
                                          os.path.join(save_dir, f'{ds}_ddlp{run_prefix}_best_lpips.pth'))
                     torch.cuda.empty_cache()
         valid_losses.append(valid_loss)

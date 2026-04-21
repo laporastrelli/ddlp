@@ -145,6 +145,8 @@ def train_ddlp(config_path='./configs/balls.json'):
     # optimizer and scheduler
     optimizer = optim.Adam(model.get_parameters(), lr=lr, betas=adam_betas, eps=adam_eps, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=scheduler_gamma, verbose=True)
+    train_start_epoch = 0
+    resume_iteration = None
 
     # load pretrained model
     if load_model and pretrained_path is not None:
@@ -156,11 +158,21 @@ def train_ddlp(config_path='./configs/balls.json'):
                 model.load_state_dict(checkpoint['model_state_dict'])
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                checkpoint_epoch = checkpoint.get('epoch', 0)
+                checkpoint_epoch = checkpoint.get('epoch', -1)
+                if checkpoint_epoch is None:
+                    checkpoint_epoch = -1
+                train_start_epoch = int(checkpoint_epoch) + 1
+                if checkpoint.get('iteration', None) is not None:
+                    resume_iteration = int(checkpoint['iteration'])
                 print(f"✓ Loaded complete checkpoint from epoch {checkpoint_epoch}")
                 print(f"  - Model weights: ✓")
                 print(f"  - Optimizer state: ✓")
                 print(f"  - Scheduler state: ✓ (LR will continue from checkpoint)")
+                if resume_iteration is not None:
+                    print(f"  - Iteration state: ✓ (iteration={resume_iteration})")
+                else:
+                    print("  - Iteration state: ✗ (will infer from epoch count)")
+                print(f"  - Training will resume at epoch {train_start_epoch}")
             else:
                 # OLD FORMAT: Only model state_dict (no optimizer/scheduler)
                 model.load_state_dict(checkpoint)
@@ -226,9 +238,23 @@ def train_ddlp(config_path='./configs/balls.json'):
     dynamics_warmup_iters = max(warmup_epoch, 1) * max(10_000, iter_per_epoch)
     iter_per_step = dynamics_warmup_iters // timestep_horizon
     max_iterations_per_step = [iter_per_step * (i + 1) for i in range(timestep_horizon)]
-    iteration = 0  # initialize iterations counter
+    if resume_iteration is not None:
+        iteration = resume_iteration
+    else:
+        # Fallback for checkpoints that do not store iteration yet.
+        # We increment iteration once per batch when epoch >= start_epoch.
+        resumed_dyn_epochs = max(0, train_start_epoch - start_epoch)
+        iteration = resumed_dyn_epochs * iter_per_epoch
 
-    for epoch in range(num_epochs):
+    if train_start_epoch >= num_epochs:
+        print(f"Checkpoint already reached epoch {train_start_epoch - 1}, "
+              f"which is >= num_epochs-1 ({num_epochs - 1}). Nothing to train.")
+        return model
+
+    if train_start_epoch > 0:
+        print(f"Resuming loop from epoch {train_start_epoch} with iteration={iteration}")
+
+    for epoch in range(train_start_epoch, num_epochs):
         model.train()
         batch_losses = []
         batch_losses_rec = []
@@ -471,7 +497,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'epoch': epoch
+                'epoch': epoch,
+                'iteration': iteration
             }
             torch.save(checkpoint, os.path.join(save_dir, f'{ds}_ddlp{run_prefix}.pth'))
             animate_trajectory_ddlp(model, config, epoch, device=device, fig_dir=fig_dir,
@@ -501,7 +528,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
-                    'epoch': epoch
+                    'epoch': epoch,
+                    'iteration': iteration
                 }
                 torch.save(checkpoint,
                            os.path.join(save_dir,
@@ -528,7 +556,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
-                        'epoch': epoch
+                        'epoch': epoch,
+                        'iteration': iteration
                     }
                     torch.save(checkpoint,
                                os.path.join(save_dir, f'{ds}_ddlp{run_prefix}_best_lpips.pth'))
