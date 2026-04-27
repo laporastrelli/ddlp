@@ -13,7 +13,8 @@ OUTPUT_BASE="${checkpoint_name}/oracle"
 RUN_NAME="c1_dyn_full"
 GT_NORMALIZATION="ddlp_similarity"
 GT_SIMILARITY_REFERENCE="${checkpoint_name}/extraction_evaluation/best/extracted_datasets/ddlp_extracted_recentered_training.h5.1"
-MONITOR_EVERY_STEPS=300
+MONITOR_EVERY_EPOCHS=1
+EXACT_EVAL_MONITOR_EVERY_EPOCHS=5
 MONITOR_NUM_VIDEOS=10
 MONITOR_MODES="train,valid,test"
 MONITOR_MAX_BATCHES=30
@@ -55,7 +56,8 @@ python3 "${TRAIN_SCRIPT}" \
   --batch_size "${BATCH_SIZE}" \
   --swap_gt_xy 1 \
   --monitor_visualizations 1 \
-  --monitor_every_steps "${MONITOR_EVERY_STEPS}" \
+  --monitor_every_epochs "${MONITOR_EVERY_EPOCHS}" \
+  --exact_eval_monitor_every_epochs "${EXACT_EVAL_MONITOR_EVERY_EPOCHS}" \
   --monitor_num_videos "${MONITOR_NUM_VIDEOS}" \
   --monitor_modes "${MONITOR_MODES}" \
   --monitor_max_batches "${MONITOR_MAX_BATCHES}" \

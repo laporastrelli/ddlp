@@ -340,12 +340,20 @@ def animate_trajectory_ddlp(model, config, epoch, device=torch.device('cpu'), fi
     batch = next(iter(dataloader))
     model_timestep_horizon = model.timestep_horizon
     cond_steps = model_timestep_horizon if cond_steps is None else cond_steps
+    available_horizon = int(batch[0].shape[1])
+    effective_horizon = min(int(timestep_horizon), available_horizon)
+    effective_cond_steps = min(int(cond_steps), effective_horizon)
+    if effective_horizon < int(timestep_horizon):
+        print(f"animate_trajectory_ddlp: requested horizon {timestep_horizon}, "
+              f"but only {available_horizon} frames are available in mode='{mode}'. "
+              f"Clamping animation horizon to {effective_horizon}.")
     model.eval()
-    x_horizon = batch[0][:, :timestep_horizon].to(device)
+    x_horizon = batch[0][:, :effective_horizon].to(device)
     # forward pass
     with torch.no_grad():
-        preds = model.sample(x_horizon, num_steps=timestep_horizon - cond_steps, deterministic=deterministic,
-                             bg_masks_from_fg=False, cond_steps=cond_steps)
+        preds = model.sample(x_horizon, num_steps=effective_horizon - effective_cond_steps,
+                             deterministic=deterministic, bg_masks_from_fg=False,
+                             cond_steps=effective_cond_steps)
         # preds: [bs, timestep_horizon, 3, im_size, im_size]
     for i in range(num_trajetories):
         gt_traj = x_horizon[i].permute(0, 2, 3, 1).data.cpu().numpy()
@@ -354,7 +362,7 @@ def animate_trajectory_ddlp(model, config, epoch, device=torch.device('cpu'), fi
             if accelerator.is_main_process:
                 animate_trajectories(gt_traj, pred_traj,
                                      path=os.path.join(fig_dir, f'{prefix}e{epoch}_traj_anim_{i}.gif'),
-                                     duration=duration, rec_to_pred_t=cond_steps)
+                                     duration=duration, rec_to_pred_t=effective_cond_steps)
         else:
             animate_trajectories(gt_traj, pred_traj, path=os.path.join(fig_dir, f'{prefix}e{epoch}_traj_anim_{i}.gif'),
-                                 duration=duration, rec_to_pred_t=cond_steps)
+                                 duration=duration, rec_to_pred_t=effective_cond_steps)

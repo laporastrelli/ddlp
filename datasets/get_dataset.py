@@ -30,7 +30,7 @@ def get_video_dataset(ds, root, seq_len=1, mode='train', image_size=128):
         dataset = Obj3D(root=root, mode=mode, sample_length=seq_len, res=image_size)
     elif ds == 'phyre':
         dataset = PhyreDataset(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
-    elif ds == 'twobody':
+    elif ds in ('twobody', 'threebody'):
         dataset = TwoBodyDataset(root=root, mode=mode, sample_length=seq_len)
     elif ds == 'langtable':
         if not LANGTABLE_AVAILABLE:
@@ -57,7 +57,7 @@ def get_image_dataset(ds, root, mode='train', image_size=128, seq_len=1):
         dataset = Obj3DImage(root=root, mode=mode, sample_length=seq_len, res=image_size)
     elif ds == 'phyre':
         dataset = PhyreDatasetImage(root=root, mode=mode, sample_length=seq_len, image_size=image_size)
-    elif ds == 'twobody':
+    elif ds in ('twobody', 'threebody'):
         dataset = TwoBodyDatasetImage(root=root, mode=mode, sample_length=seq_len)
     elif ds == 'shapes':
         if mode == 'train':
