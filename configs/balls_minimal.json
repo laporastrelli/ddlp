@@ -76,5 +76,6 @@
   "use_depth": false,
   "use_transparency": false,
   "use_scale": false,
-  "fixed_scale_value": 0.25
+  "fixed_scale_value": 0.25,
+  "use_recentering": true
 }

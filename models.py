@@ -18,13 +18,44 @@ from utils.util_func import reparameterize, create_masks_fast, spatial_transform
 from utils.loss_functions import ChamferLossKL, calc_kl, calc_reconstruction_loss, VGGDistance, calc_kl_beta_dist
 
 
+def _safe_logit(value, eps=1e-6):
+    value = min(max(float(value), eps), 1.0 - eps)
+    return float(np.log(value / (1.0 - value)))
+
+
+def _build_local_grid(h, w, device, dtype):
+    y_lin = torch.linspace(-1.0, 1.0, steps=h, device=device, dtype=dtype)
+    x_lin = torch.linspace(-1.0, 1.0, steps=w, device=device, dtype=dtype)
+    try:
+        yy, xx = torch.meshgrid(y_lin, x_lin, indexing='ij')
+    except TypeError:
+        yy, xx = torch.meshgrid(y_lin, x_lin)
+    return yy, xx
+
+
+def _alpha_centroid_yx(alpha_maps, eps=1e-6):
+    h, w = alpha_maps.shape[-2:]
+    yy, xx = _build_local_grid(h, w, alpha_maps.device, alpha_maps.dtype)
+    view_shape = (1,) * (alpha_maps.ndim - 2) + (h, w)
+    yy = yy.view(*view_shape)
+    xx = xx.view(*view_shape)
+    mass = alpha_maps.sum(dim=(-2, -1))
+    denom = mass + eps
+    mu_y = (alpha_maps * yy).sum(dim=(-2, -1)) / denom
+    mu_x = (alpha_maps * xx).sum(dim=(-2, -1)) / denom
+    centroid_yx = torch.stack([mu_y, mu_x], dim=-1)
+    valid_mask = mass > eps
+    return centroid_yx, valid_mask
+
+
 class FgDLP(nn.Module):
     def __init__(self, cdim=3, enc_channels=(16, 16, 32), prior_channels=(16, 16, 32), image_size=64, n_kp=1,
                  pad_mode='replicate', sigma=1.0, dropout=0.0,
                  patch_size=16, n_kp_enc=20, n_kp_prior=20, learned_feature_dim=16,
                  kp_range=(-1, 1), kp_activation="tanh", anchor_s=0.25,
                  use_resblock=False, use_correlation_heatmaps=True, enable_enc_attn=False,
-                 filtering_heuristic='variance'):
+                 filtering_heuristic='variance', use_depth=True, use_transparency=True,
+                 use_scale=True, fixed_scale_value=None, use_recentering=False):
         super(FgDLP, self).__init__()
         """
         DLP Foreground Module -- extract objects from an image
@@ -62,12 +93,19 @@ class FgDLP(nn.Module):
         self.learned_feature_dim = learned_feature_dim
         assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
         self.anchor_s = anchor_s
+        self.use_depth = use_depth
+        self.use_transparency = use_transparency
+        self.use_scale = use_scale
+        self.use_recentering = use_recentering
+        self.fixed_scale_value = anchor_s if fixed_scale_value is None else fixed_scale_value
         self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
         self.exclusive_patches = False
         self.cdim = cdim
         self.use_resblock = use_resblock
         self.use_correlation_heatmaps = use_correlation_heatmaps
         self.enable_enc_attn = enable_enc_attn
+        self.register_buffer('fixed_scale_logit',
+                             torch.tensor(_safe_logit(self.fixed_scale_value), dtype=torch.float32))
         assert filtering_heuristic in ['distance', 'variance',
                                        'random', 'none'], f'unknown filtering heuristic: {filtering_heuristic}'
         self.filtering_heuristic = filtering_heuristic
@@ -152,6 +190,33 @@ class FgDLP(nn.Module):
                 # use pytorch's default
                 pass
 
+    def _constant_scale_like(self, reference, normalized=False):
+        scalar = self.fixed_scale_value if normalized else float(self.fixed_scale_logit.item())
+        scalar_t = torch.tensor(scalar, device=reference.device, dtype=reference.dtype)
+        return torch.ones_like(reference) * scalar_t
+
+    def _recenter_decoded_objects(self, dec_objects, z_kp, z_scale=None, eps=1e-6):
+        alpha_patch = dec_objects[:, :, 0]
+        mu_local_yx, valid_mask = _alpha_centroid_yx(alpha_patch, eps=eps)
+        shift_local = -mu_local_yx
+        bsz, n_kp, ch, patch_h, patch_w = dec_objects.shape
+        dec_objects_flat = dec_objects.reshape(-1, ch, patch_h, patch_w)
+        shift_flat = shift_local.reshape(-1, shift_local.shape[-1])
+        unit_scale = torch.ones_like(shift_flat)
+        out_dims = (dec_objects_flat.shape[0], ch, patch_h, patch_w)
+        recentered = spatial_transform(dec_objects_flat, shift_flat, unit_scale, out_dims, inverse=False)
+        recentered = recentered.view_as(dec_objects)
+        if z_scale is None:
+            scale_norm = torch.full_like(z_kp, patch_h / self.image_size)
+        else:
+            scale_norm = torch.sigmoid(z_scale)
+        delta = scale_norm * mu_local_yx
+        delta = torch.where(valid_mask.unsqueeze(-1), delta, torch.zeros_like(delta))
+        z_kp_recentered = z_kp + delta
+        valid_mask = valid_mask[:, :, None, None, None]
+        recentered = torch.where(valid_mask, recentered, dec_objects)
+        return recentered, z_kp_recentered
+
     def encode_all(self, x, deterministic=False, noisy=False, warmup=False, kp_init=None, cropped_objects_prev=None,
                    scale_prev=None, refinement_iter=False, with_offset=True):
         """
@@ -204,20 +269,31 @@ class FgDLP(nn.Module):
         
         mu_scale = particle_stats_dict['mu_scale']
         logvar_scale = particle_stats_dict['logvar_scale']
+        if not self.use_scale:
+            mu_scale = self._constant_scale_like(mu_scale)
+            logvar_scale = torch.zeros_like(mu_scale)
 
         lobj_on_a = particle_stats_dict['lobj_on_a']
         lobj_on_b = particle_stats_dict['lobj_on_b']
         mu_depth = particle_stats_dict['mu_depth']
         logvar_depth = particle_stats_dict['logvar_depth']
+        if not self.use_depth:
+            mu_depth = torch.zeros_like(mu_depth)
+            logvar_depth = torch.zeros_like(mu_depth)
         
         # final position
         mu_tot = z_base + mu_offset
         logvar_tot = logvar_offset
 
         # obj_on distribution (Beta)
-        obj_on_a = lobj_on_a.exp().clamp_min(1e-5)
-        obj_on_b = lobj_on_b.exp().clamp_min(1e-5)
-        obj_on_beta_dist = torch.distributions.Beta(obj_on_a, obj_on_b)
+        if self.use_transparency:
+            obj_on_a = lobj_on_a.exp().clamp_min(1e-5)
+            obj_on_b = lobj_on_b.exp().clamp_min(1e-5)
+            obj_on_beta_dist = torch.distributions.Beta(obj_on_a, obj_on_b)
+        else:
+            obj_on_a = torch.ones(batch_size, self.n_kp_enc, device=x.device, dtype=mu_tot.dtype)
+            obj_on_b = torch.ones_like(obj_on_a)
+            obj_on_beta_dist = None
 
         # reparameterize
         if deterministic:
@@ -225,16 +301,16 @@ class FgDLP(nn.Module):
             z_offset = mu_offset
             z_scale = mu_scale
             z_depth = mu_depth
-            z_obj_on = obj_on_beta_dist.mean
+            z_obj_on = obj_on_beta_dist.mean if self.use_transparency else torch.ones_like(obj_on_a)
         else:
             z = reparameterize(mu_tot, logvar_tot) if with_offset else mu_tot
             z_offset = reparameterize(mu_offset, logvar_offset)  # not used
-            z_scale = reparameterize(mu_scale, logvar_scale)
-            z_depth = reparameterize(mu_depth, logvar_depth)
-            z_obj_on = obj_on_beta_dist.rsample()
+            z_scale = reparameterize(mu_scale, logvar_scale) if self.use_scale else mu_scale
+            z_depth = reparameterize(mu_depth, logvar_depth) if self.use_depth else mu_depth
+            z_obj_on = obj_on_beta_dist.rsample() if self.use_transparency else torch.ones_like(obj_on_a)
 
         # during warm-up and noisy stages we use small values around the patch size for the scale
-        if z_scale is not None and noisy:
+        if self.use_scale and z_scale is not None and noisy:
             anchor_size = self.anchor_s
             z_scale = 0.0 * z_scale + (np.log(anchor_size / (1 - anchor_size + 1e-5)) + 0.1 * torch.randn_like(z_scale))
         # to avoid null cases where obj_on -> 0, we noise its values during the noisy stage
@@ -328,6 +404,8 @@ class FgDLP(nn.Module):
         dec_objects = self.object_dec(z_features)  # [bs * n_kp, 4, patch_size, patch_size]
         dec_objects = dec_objects.view(-1, self.n_kp_enc,
                                        *dec_objects.shape[1:])  # [bs, n_kp, 4, patch_size, patch_size]
+        if self.use_recentering:
+            dec_objects, z_kp = self._recenter_decoded_objects(dec_objects, z_kp, z_scale=z_scale)
         # translate patches - place the decoded glimpses on the canvas
         dec_objects_trans = self.translate_patches(z_kp, dec_objects, z_scale, translation)
         dec_objects_trans = dec_objects_trans.clamp(0, 1)  # STN can change values to be < 0
@@ -573,7 +651,9 @@ class ObjectDLP(nn.Module):
                  bg_learned_feature_dim=None,
                  kp_range=(-1, 1), kp_activation="tanh", anchor_s=0.25, use_tracking=False,
                  use_resblock=False, scale_std=0.3, offset_std=0.2, obj_on_alpha=0.1, obj_on_beta=0.1,
-                 use_correlation_heatmaps=False, enable_enc_attn=False, filtering_heuristic='variance'):
+                 use_correlation_heatmaps=False, enable_enc_attn=False, filtering_heuristic='variance',
+                 use_depth=True, use_transparency=True, use_scale=True, fixed_scale_value=None,
+                 use_recentering=False):
         super(ObjectDLP, self).__init__()
         """
         cdim: channels of the input image (3...)
@@ -617,6 +697,10 @@ class ObjectDLP(nn.Module):
         self.bg_learned_feature_dim = learned_feature_dim if bg_learned_feature_dim is None else bg_learned_feature_dim
         assert self.bg_learned_feature_dim > 0, "bg_learned_feature_dim must be greater than 0"
         self.anchor_s = anchor_s
+        self.use_depth = use_depth
+        self.use_transparency = use_transparency
+        self.use_scale = use_scale
+        self.use_recentering = use_recentering
         self.obj_patch_size = np.round(anchor_s * image_size).astype(int)
         # print(f'object patch size: {self.obj_patch_size}')
         self.cdim = cdim
@@ -645,7 +729,9 @@ class ObjectDLP(nn.Module):
                                kp_activation=kp_activation, anchor_s=anchor_s,
                                use_resblock=self.use_resblock,
                                use_correlation_heatmaps=use_correlation_heatmaps, enable_enc_attn=enable_enc_attn,
-                               filtering_heuristic=filtering_heuristic)
+                               filtering_heuristic=filtering_heuristic, use_depth=use_depth,
+                               use_transparency=use_transparency, use_scale=use_scale,
+                               fixed_scale_value=fixed_scale_value, use_recentering=use_recentering)
 
         # background module
         self.bg_module = BgDLP(cdim=cdim, enc_channels=enc_channels, image_size=image_size, pad_mode=pad_mode,
@@ -675,6 +761,7 @@ class ObjectDLP(nn.Module):
         log_str += f'particle visual feature dim: {self.learned_feature_dim}\n'
         log_str += f'bg visual feature dim: {self.bg_learned_feature_dim}\n'
         log_str += f'posterior object patch size: {self.obj_patch_size}\n'
+        log_str += f'minimal latent flags: scale={self.use_scale}, depth={self.use_depth}, transparency={self.use_transparency}, recenter={self.use_recentering}\n'
         # cnns output sizes
         # prior
         prior_cnn_size = self.fg_module.prior.enc.conv_output_size
@@ -1178,6 +1265,8 @@ class ObjectDLP(nn.Module):
         loss_kl_depth = calc_kl(logvar_depth.view(-1, logvar_depth.shape[-1]),
                                 mu_depth.view(-1, mu_depth.shape[-1]), reduce='none')
         loss_kl_depth = (loss_kl_depth.view(-1, self.n_kp_enc)).sum(-1).mean()
+        if not self.use_depth:
+            loss_kl_depth = torch.zeros((), device=x.device)
 
         # scale
         # assume sigmoid activation on z_scale
@@ -1186,6 +1275,8 @@ class ObjectDLP(nn.Module):
                                 reduce='none')
 
         loss_kl_scale = (loss_kl_scale.view(-1, self.n_kp_enc)).sum(-1).mean()
+        if not self.use_scale:
+            loss_kl_scale = torch.zeros((), device=x.device)
 
         # obj_on
         loss_kl_obj_on = calc_kl_beta_dist(obj_on_a, obj_on_b,
@@ -1193,6 +1284,8 @@ class ObjectDLP(nn.Module):
                                            obj_on_b_prior).sum(-1)
         loss_kl_obj_on = loss_kl_obj_on.mean()
         obj_on_l1 = torch.abs(obj_on).sum(-1).mean()
+        if not self.use_transparency:
+            loss_kl_obj_on = torch.zeros((), device=x.device)
 
         # features
         loss_kl_feat = calc_kl(logvar_features.view(-1, logvar_features.shape[-1]),
@@ -1234,7 +1327,8 @@ class ObjectDynamicsDLP(nn.Module):
                  kp_range=(-1, 1), kp_activation="tanh", anchor_s=0.25, predict_delta=True,
                  timestep_horizon=10, enable_enc_attn=False, use_correlation_heatmaps=True,
                  use_resblock=False, scale_std=0.3, offset_std=0.2, obj_on_alpha=0.1, obj_on_beta=0.1, pint_layers=6,
-                 pint_heads=8, pint_dim=256, filtering_heuristic='variance'):
+                 pint_heads=8, pint_dim=256, filtering_heuristic='variance', use_depth=True,
+                 use_transparency=True, use_scale=True, fixed_scale_value=None, use_recentering=False):
         super(ObjectDynamicsDLP, self).__init__()
         """
         cdim: channels of the input image (3...)
@@ -1279,6 +1373,10 @@ class ObjectDynamicsDLP(nn.Module):
         self.bg_learned_feature_dim = learned_feature_dim if bg_learned_feature_dim is None else bg_learned_feature_dim
         assert self.bg_learned_feature_dim > 0, "bg_learned_feature_dim must be greater than 0"
         self.anchor_s = anchor_s
+        self.use_depth = use_depth
+        self.use_transparency = use_transparency
+        self.use_scale = use_scale
+        self.use_recentering = use_recentering
         self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
         # print(f'object patch size: {self.obj_patch_size}')
         self.enable_enc_attn = enable_enc_attn
@@ -1310,7 +1408,9 @@ class ObjectDynamicsDLP(nn.Module):
                                n_kp_prior=n_kp_prior, learned_feature_dim=learned_feature_dim, kp_range=kp_range,
                                kp_activation=kp_activation, anchor_s=anchor_s,
                                use_resblock=self.use_resblock, use_correlation_heatmaps=use_correlation_heatmaps,
-                               enable_enc_attn=self.enable_enc_attn, filtering_heuristic=filtering_heuristic)
+                               enable_enc_attn=self.enable_enc_attn, filtering_heuristic=filtering_heuristic,
+                               use_depth=use_depth, use_transparency=use_transparency, use_scale=use_scale,
+                               fixed_scale_value=fixed_scale_value, use_recentering=use_recentering)
         # background module
         self.bg_module = BgDLP(cdim=cdim, enc_channels=enc_channels, image_size=image_size, pad_mode=pad_mode,
                                dropout=dropout, learned_feature_dim=self.bg_learned_feature_dim, n_kp_enc=n_kp_enc,
@@ -1323,7 +1423,9 @@ class ObjectDynamicsDLP(nn.Module):
                                       projection_dim=pint_inner_dim,
                                       n_head=self.pint_heads, n_layer=self.pint_layers, block_size=timestep_horizon,
                                       kp_activation=kp_activation, predict_delta=self.predict_delta, max_delta=1.0,
-                                      positional_bias=True, max_particles=max_particles)
+                                      positional_bias=True, max_particles=max_particles, use_depth=use_depth,
+                                      use_transparency=use_transparency, use_scale=use_scale,
+                                      fixed_scale_value=fixed_scale_value)
         self.init_weights()
 
     def get_parameters(self, prior=True, encoder=True, decoder=True, dynamics=True):
@@ -1351,6 +1453,7 @@ class ObjectDynamicsDLP(nn.Module):
         log_str += f'particle visual feature dim: {self.learned_feature_dim}\n'
         log_str += f'bg visual feature dim: {self.bg_learned_feature_dim}\n'
         log_str += f'posterior object patch size: {self.obj_patch_size}\n'
+        log_str += f'minimal latent flags: scale={self.use_scale}, depth={self.use_depth}, transparency={self.use_transparency}, recenter={self.use_recentering}\n'
         # cnns output sizes
         # prior
         prior_cnn_size = self.fg_module.prior.enc.conv_output_size
@@ -2412,6 +2515,8 @@ class ObjectDynamicsDLP(nn.Module):
         loss_kl_depth = calc_kl(logvar_depth_0.reshape(-1, logvar_depth_0.shape[-1]),
                                 mu_depth_0.reshape(-1, mu_depth_0.shape[-1]), reduce='none')
         loss_kl_depth = (loss_kl_depth.view(-1, num_static, self.n_kp_enc)).sum(dim=(-2, -1)).mean()
+        if not self.use_depth:
+            loss_kl_depth = torch.zeros((), device=x.device)
 
         # scale
         # assume sigmoid activation on z_scale
@@ -2420,6 +2525,8 @@ class ObjectDynamicsDLP(nn.Module):
                                 mu_o=mu_scale_prior, logvar_o=logvar_scale_p,
                                 reduce='none')
         loss_kl_scale = (loss_kl_scale.view(-1, num_static, self.n_kp_enc)).sum(dim=(-2, -1)).mean()
+        if not self.use_scale:
+            loss_kl_scale = torch.zeros((), device=x.device)
 
         # obj_on (transparency)
         loss_kl_obj_on = calc_kl_beta_dist(obj_on_a_0, obj_on_b_0,
@@ -2427,6 +2534,8 @@ class ObjectDynamicsDLP(nn.Module):
                                            obj_on_b_prior).sum(dim=(-2, -1))
         loss_kl_obj_on = loss_kl_obj_on.mean()
         obj_on_l1 = torch.abs(obj_on).sum(-1).mean()  # just to get an idea how many particles are turned on
+        if not self.use_transparency:
+            loss_kl_obj_on = torch.zeros((), device=x.device)
 
         # features
         loss_kl_feat = calc_kl(logvar_features_0.reshape(-1, logvar_features_0.shape[-1]),
@@ -2455,6 +2564,8 @@ class ObjectDynamicsDLP(nn.Module):
                                                obj_on_a_dyn, obj_on_b_dyn, balance=balance).sum(-1)
         loss_kl_obj_on_dyn = loss_kl_obj_on_dyn.reshape(batch_size, -1)
         loss_kl_obj_on_dyn = (loss_kl_obj_on_dyn * discount[None, :]).sum(-1).mean()
+        if not self.use_transparency:
+            loss_kl_obj_on_dyn = torch.zeros((), device=x.device)
 
         # position
         mu_dyn_post_offset = mu_tot.reshape(batch_size, timestep_horizon + 1, *mu_tot.shape[1:])[:, num_static:]
@@ -2482,6 +2593,8 @@ class ObjectDynamicsDLP(nn.Module):
                                     reduce='none', balance=balance)
         loss_kl_scale_dyn = (loss_kl_scale_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
         loss_kl_scale_dyn = (loss_kl_scale_dyn * discount[None, :]).sum(-1).mean()
+        if not self.use_scale:
+            loss_kl_scale_dyn = torch.zeros((), device=x.device)
 
         # depth
         mu_depth_dyn_post = mu_depth.reshape(batch_size, timestep_horizon + 1, *mu_depth.shape[1:])[:, num_static:]
@@ -2495,6 +2608,8 @@ class ObjectDynamicsDLP(nn.Module):
                                     reduce='none', balance=balance)
         loss_kl_depth_dyn = (loss_kl_depth_dyn.view(batch_size, -1, self.n_kp_enc)).sum(-1)
         loss_kl_depth_dyn = (loss_kl_depth_dyn * discount[None, :]).sum(-1).mean()
+        if not self.use_depth:
+            loss_kl_depth_dyn = torch.zeros((), device=x.device)
 
         # features
         mu_features_dyn_post = mu_features.reshape(batch_size, timestep_horizon + 1, *mu_features.shape[1:])[:,
@@ -2668,6 +2783,8 @@ class ObjectDynamicsDLP(nn.Module):
         loss_kl_depth = calc_kl(logvar_depth.reshape(-1, logvar_depth.shape[-1]),
                                 mu_depth.reshape(-1, mu_depth.shape[-1]), reduce='none')
         loss_kl_depth = (loss_kl_depth.view(-1, self.n_kp_enc)).sum(-1).mean()
+        if not self.use_depth:
+            loss_kl_depth = torch.zeros((), device=x.device)
 
         # scale
         # assume sigmoid activation on z_scale
@@ -2676,6 +2793,8 @@ class ObjectDynamicsDLP(nn.Module):
                                 mu_o=mu_scale_prior, logvar_o=logvar_scale_p,
                                 reduce='none')
         loss_kl_scale = (loss_kl_scale.view(-1, self.n_kp_enc)).sum(-1).mean()
+        if not self.use_scale:
+            loss_kl_scale = torch.zeros((), device=x.device)
 
         # obj_on
         loss_kl_obj_on = calc_kl_beta_dist(obj_on_a, obj_on_b,
@@ -2683,6 +2802,8 @@ class ObjectDynamicsDLP(nn.Module):
                                            obj_on_b_prior).sum(-1)
         loss_kl_obj_on = loss_kl_obj_on.mean()
         obj_on_l1 = torch.abs(obj_on).sum(-1).mean()  # just to get an idea how many particles are turned on
+        if not self.use_transparency:
+            loss_kl_obj_on = torch.zeros((), device=x.device)
 
         # features
         loss_kl_feat = calc_kl(logvar_features.reshape(-1, logvar_features.shape[-1]),

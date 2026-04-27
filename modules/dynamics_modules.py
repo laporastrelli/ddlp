@@ -400,7 +400,8 @@ class DynamicsDLP(nn.Module):
     def __init__(self, features_dim, bg_features_dim, hidden_dim, projection_dim,
                  n_head=4, n_layer=2, block_size=12, dropout=0.1,
                  kp_activation='tanh', predict_delta=True, max_delta=1.0,
-                 positional_bias=True, max_particles=None):
+                 positional_bias=True, max_particles=None, use_depth=True,
+                 use_transparency=True, use_scale=True, fixed_scale_value=None):
         super(DynamicsDLP, self).__init__()
         """
         DLP Dynamics Module (PINT)
@@ -409,6 +410,13 @@ class DynamicsDLP(nn.Module):
         self.projection_dim = projection_dim
         self.max_delta = max_delta
         self.max_particles = max_particles  # for positional bias
+        self.use_depth = use_depth
+        self.use_transparency = use_transparency
+        self.use_scale = use_scale
+        fixed_scale_value = 0.25 if fixed_scale_value is None else fixed_scale_value
+        fixed_scale_value = min(max(float(fixed_scale_value), 1e-6), 1.0 - 1e-6)
+        self.register_buffer('fixed_scale_logit',
+                             torch.tensor(math.log(fixed_scale_value / (1.0 - fixed_scale_value)), dtype=torch.float32))
         self.particle_projection = ParticleFeatureProjection(features_dim, bg_features_dim,
                                                              hidden_dim, self.projection_dim)
         self.particle_transformer = ParticleTransformer(self.projection_dim, n_head, n_layer,
@@ -420,6 +428,9 @@ class DynamicsDLP(nn.Module):
         self.particle_decoder = ParticleFeatureDecoder(self.projection_dim, features_dim, bg_features_dim,
                                                        hidden_dim, kp_activation=kp_activation, max_delta=max_delta,
                                                        delta_features=predict_delta)
+
+    def _constant_scale_like(self, reference):
+        return torch.ones_like(reference) * self.fixed_scale_logit.to(device=reference.device, dtype=reference.dtype)
 
     def sample(self, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features, steps=10, deterministic=False):
         """
@@ -492,27 +503,36 @@ class DynamicsDLP(nn.Module):
                 mu_features = z_features[:, -1].unsqueeze(1) + mu_features
                 mu_bg_features = z_bg_features[:, -1].unsqueeze(1) + mu_bg_features
 
-            # if torch.isnan(obj_on_a).any():
-            #     print(f'obj_on_a has nan')
-            #     torch.nan_to_num_(obj_on_a, nan=0.01)
-            # if torch.isnan(obj_on_b).any():
-            #     print(f'obj_on_b has nan')
-            #     torch.nan_to_num_(obj_on_b, nan=0.01)
-            beta_dist = Beta(obj_on_a, obj_on_b)
+            if not self.use_scale:
+                mu_scale = self._constant_scale_like(mu_scale)
+                logvar_scale = torch.zeros_like(mu_scale)
+            if not self.use_depth:
+                mu_depth = torch.zeros_like(mu_depth)
+                logvar_depth = torch.zeros_like(mu_depth)
+            if not self.use_transparency:
+                obj_on_a = torch.ones_like(obj_on_a)
+                obj_on_b = torch.ones_like(obj_on_b)
+
             if deterministic:
                 new_z = mu
-                new_z_depth = mu_depth
-                new_z_scale = mu_scale
+                new_z_depth = mu_depth if self.use_depth else torch.zeros_like(mu_depth)
+                new_z_scale = mu_scale if self.use_scale else self._constant_scale_like(mu_scale)
                 new_z_features = mu_features
                 new_z_bg_features = mu_bg_features
-                new_z_obj_on = beta_dist.mean
+                if self.use_transparency:
+                    new_z_obj_on = Beta(obj_on_a, obj_on_b).mean
+                else:
+                    new_z_obj_on = torch.ones_like(obj_on_a)
             else:
                 new_z = reparameterize(mu, logvar)
-                new_z_depth = reparameterize(mu_depth, logvar_depth)
-                new_z_scale = reparameterize(mu_scale, logvar_scale)
+                new_z_depth = reparameterize(mu_depth, logvar_depth) if self.use_depth else torch.zeros_like(mu_depth)
+                new_z_scale = reparameterize(mu_scale, logvar_scale) if self.use_scale else self._constant_scale_like(mu_scale)
                 new_z_features = reparameterize(mu_features, logvar_features)
                 new_z_bg_features = reparameterize(mu_bg_features, logvar_bg_features)
-                new_z_obj_on = beta_dist.sample()
+                if self.use_transparency:
+                    new_z_obj_on = Beta(obj_on_a, obj_on_b).sample()
+                else:
+                    new_z_obj_on = torch.ones_like(obj_on_a)
 
             z = torch.cat([z, new_z], dim=1)
             z_depth = torch.cat([z_depth, new_z_depth], dim=1)
@@ -589,6 +609,16 @@ class DynamicsDLP(nn.Module):
             mu_depth = z_depth + mu_depth
             mu_features = z_features + mu_features
             mu_bg_features = z_bg_features + mu_bg_features
+
+        if not self.use_scale:
+            mu_scale = self._constant_scale_like(mu_scale)
+            logvar_scale = torch.zeros_like(mu_scale)
+        if not self.use_depth:
+            mu_depth = torch.zeros_like(mu_depth)
+            logvar_depth = torch.zeros_like(mu_depth)
+        if not self.use_transparency:
+            obj_on_a = torch.ones_like(obj_on_a)
+            obj_on_b = torch.ones_like(obj_on_b)
 
         output_dict = {}
 

@@ -83,6 +83,11 @@ def train_ddlp(config_path='./configs/balls.json'):
     use_correlation_heatmaps = config['use_correlation_heatmaps']  # use heatmaps for tracking
     enable_enc_attn = config['enable_enc_attn']  # enable attention between patches in the particle encoder
     filtering_heuristic = config["filtering_heuristic"]  # filtering heuristic to filter prior keypoints
+    use_depth = config.get('use_depth', True)
+    use_transparency = config.get('use_transparency', True)
+    use_scale = config.get('use_scale', True)
+    fixed_scale_value = config.get('fixed_scale_value', anchor_s)
+    use_recentering = config.get('use_recentering', False)
 
     # optimization
     warmup_epoch = config['warmup_epoch']
@@ -124,7 +129,9 @@ def train_ddlp(config_path='./configs/balls.json'):
                               scale_std=scale_std, offset_std=offset_std, obj_on_alpha=obj_on_alpha,
                               obj_on_beta=obj_on_beta, pint_layers=pint_layers, pint_heads=pint_heads,
                               pint_dim=pint_dim, use_correlation_heatmaps=use_correlation_heatmaps,
-                              enable_enc_attn=enable_enc_attn, filtering_heuristic=filtering_heuristic).to(device)
+                              enable_enc_attn=enable_enc_attn, filtering_heuristic=filtering_heuristic,
+                              use_depth=use_depth, use_transparency=use_transparency, use_scale=use_scale,
+                              fixed_scale_value=fixed_scale_value, use_recentering=use_recentering).to(device)
     print(model.info())
 
     # prepare saving location
