@@ -1,4 +1,5 @@
-# ddlp
+# ddlp (LOCAL)
+
 
 [TMLR 2024] Official PyTorch implementation of the paper "DDLP: Unsupervised Object-centric Video Prediction with Deep Dynamic Latent
 Particles".

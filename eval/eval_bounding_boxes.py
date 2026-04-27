@@ -2131,13 +2131,15 @@ def _build_prob_encoder_route_mean(
     latent_recenter_eps,
     kp_range,
 ):
-    """Reconstruct the probabilistic encoder mean for C1-family checkpoints."""
+    """Reconstruct the probabilistic encoder mean for supported oracle routes."""
     kp_min, kp_max = float(kp_range[0]), float(kp_range[1])
     mu_nom_train = train_out['z_base'] + train_out['mu_offset']
+    if route in {'c2', 'c2-dyn-attrs'}:
+        return mu_nom_train.clamp(min=kp_min, max=kp_max), None
     if route not in {'c1', 'c1-dyn-attrs'}:
         raise ValueError(
             f"Unknown probabilistic encoder route: {route}. "
-            "Expected one of ['c1','c1-dyn-attrs']."
+            "Expected one of ['c1','c1-dyn-attrs','c2','c2-dyn-attrs']."
         )
     if frozen_out is None:
         raise RuntimeError(
@@ -2173,11 +2175,14 @@ def _normalize_prob_encoder_route(route):
         "c1": "c1",
         "c1-dyn-attrs": "c1-dyn-attrs",
         "c1_dyn_attrs": "c1-dyn-attrs",
+        "c2": "c2",
+        "c2-dyn-attrs": "c2-dyn-attrs",
+        "c2_dyn_attrs": "c2-dyn-attrs",
     }
     if route_key not in aliases:
         raise ValueError(
             "prob_encoder_route must be one of "
-            "['none','c1','c1-dyn-attrs','c1_dyn_attrs'], "
+            "['none','c1','c1-dyn-attrs','c1_dyn_attrs','c2','c2-dyn-attrs','c2_dyn_attrs'], "
             f"got '{route}'"
         )
     return aliases[route_key]
@@ -2278,6 +2283,8 @@ def video_to_trajectory(
             'c1' and 'c1-dyn-attrs' load probabilistic encoder checkpoints and
             reconstruct the recentering-biased C1-family mean using
             prob_encoder_frozen_model.
+            'c2' and 'c2-dyn-attrs' use the direct nominal probabilistic-encoder
+            mean without frozen recentering.
         prob_encoder_frozen_model: Frozen base DDLP model required for
             prob_encoder_route in {'c1', 'c1-dyn-attrs'}.
         raw_physical_npz_root: Optional synchronized NPZ root containing raw
@@ -4784,10 +4791,10 @@ def main():
                             "Use 'auto' to infer from the DDLP HDF5 root, or 'none' to disable."
                         ))
     parser.add_argument('--prob_encoder_checkpoint', type=str, default=None,
-                        help='Optional probabilistic encoder checkpoint (C1 family) to use as the latent position source')
+                        help='Optional probabilistic encoder checkpoint (C1/C2 family) to use as the latent position source')
     parser.add_argument('--prob_encoder_route', type=str, default='none',
-                        choices=['none', 'c1', 'c1-dyn-attrs', 'c1_dyn_attrs'],
-                        help="Probabilistic encoder route label: 'c1', 'c1-dyn-attrs', 'c1_dyn_attrs', or 'none'")
+                        choices=['none', 'c1', 'c1-dyn-attrs', 'c1_dyn_attrs', 'c2', 'c2-dyn-attrs', 'c2_dyn_attrs'],
+                        help="Probabilistic encoder route label: 'c1', 'c1-dyn-attrs', 'c2', 'c2-dyn-attrs', or 'none'")
     parser.add_argument('--prob_encoder_output_tag', type=str, default=None,
                         help='Optional output-directory tag for probabilistic-encoder evaluations (e.g. c1_dyn_full).')
     parser.add_argument('--write_prob_encoder_alignment_metrics', type=int, default=0,
@@ -4915,7 +4922,7 @@ def main():
             raise ValueError("--prob_encoder_route requires --extraction_method latent.")
         if args.latent_position_variant != 'nominal':
             raise ValueError(
-                "Probabilistic encoder export emits the selected C1-family mean as the nominal latent stream. "
+                "Probabilistic encoder export emits the selected oracle-route mean as the nominal latent stream. "
                 "Use --latent_position_variant nominal."
             )
     if args.prob_encoder_route == 'none' and args.prob_encoder_checkpoint is not None:

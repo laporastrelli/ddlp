@@ -5,12 +5,12 @@ set -euo pipefail
 TRAIN_SCRIPT="/data2/users/lr4617/ddlp/eval/train_probabilistic_encoder_route_f.py"
 checkpoint_name="/data2/users/lr4617/ddlp/outputs/040426_084653_twobody_ddlp_minimal_off_cnt_BIG"
 CHECKPOINT_NAME_ARG="best"
+LAGRANGIAN_CHECKPOINT="/data2/users/lr4617/discrete_lagrangian/del_pytorch/outputs/regularized/ghnn_generated_BIG_TRUE_matched_lam0p1"
 EPOCHS=50
 DEVICE="cuda:0"
 BATCH_SIZE=32
 OUTPUT_BASE="${checkpoint_name}/oracle"
-ROUTE="f1"
-RUN_NAME="c1"
+RUN_NAME="c2_dyn"
 GT_NORMALIZATION="ddlp_similarity"
 GT_SIMILARITY_REFERENCE="${checkpoint_name}/extraction_evaluation/best/extracted_datasets/ddlp_extracted_recentered_training.h5.1"
 MONITOR_EVERY_EPOCHS=1
@@ -40,8 +40,14 @@ fi
 python3 "${TRAIN_SCRIPT}" \
   --checkpoint "${checkpoint_name}" \
   --checkpoint_name "${RESOLVED_CHECKPOINT_NAME}" \
-  --route "${ROUTE}" \
+  --route c2 \
+  --objective c1_dyn \
+  --beta 1 \
+  --trainable_attribute_set position_only \
   --position_head_training mean_only \
+  --lagrangian_checkpoint "${LAGRANGIAN_CHECKPOINT}" \
+  --dyn_weak_window 0 \
+  --dyn_latent_to_pixel_mode ddlp_similarity_inverse \
   --gt_normalization "${GT_NORMALIZATION}" \
   --gt_similarity_reference "${GT_SIMILARITY_REFERENCE}" \
   --epochs "${EPOCHS}" \

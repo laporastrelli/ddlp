@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Supervised probabilistic encoder trainer for Route F.
+Supervised probabilistic encoder trainer for oracle probabilistic-encoder routes.
 
 Implements:
 - Route F.1 / C1: recentering-biased sequential Gaussian encoder
-- C1-dyn: C1 position objective plus a fixed DEL weak residual in D6-TRUE coordinates
+- Route C2: pure direct position regression with q_theta = mu_nom_train
+- C1/C2-dyn: position objective plus a fixed DEL weak residual in D6-TRUE coordinates
 
 Design choices follow:
 - guidance_ablation_experimental_plan.md, Route F + Phase 0
@@ -37,7 +38,7 @@ import torch
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
@@ -226,6 +227,8 @@ def _update_adaptive_beta_state(
     adaptive_beta_state: Dict[str, float],
     *,
     c: float,
+    floor_rho: float,
+    floor_warmup_steps: int,
     ema_decay: float,
     eps: float,
     position_mse: float,
@@ -245,8 +248,21 @@ def _update_adaptive_beta_state(
     fit_quality = 1.0 - float(fit_mse_ema) / fit_mse_ref
     fit_quality = max(0.0, min(1.0, fit_quality))
     gate = fit_quality
-    beta_ratio = float(c) * float(pos_grad_ema) / max(float(del_grad_ema), float(eps))
-    beta_eff = gate * beta_ratio
+    beta_adaptive_nogate = float(c) * float(pos_grad_ema) / max(float(del_grad_ema), float(eps))
+
+    beta_floor_count = int(adaptive_beta_state.get('beta_floor_count', 0))
+    beta_floor_pos_sum = float(adaptive_beta_state.get('beta_floor_pos_sum', 0.0))
+    beta_floor_del_sum = float(adaptive_beta_state.get('beta_floor_del_sum', 0.0))
+    if beta_floor_count < int(floor_warmup_steps):
+        beta_floor_pos_sum += float(pos_grad_norm)
+        beta_floor_del_sum += float(del_grad_norm)
+        beta_floor_count += 1
+
+    denom_count = max(beta_floor_count, 1)
+    pos_grad_init_mean = beta_floor_pos_sum / float(denom_count)
+    del_grad_init_mean = beta_floor_del_sum / float(denom_count)
+    beta_floor = float(floor_rho) * float(pos_grad_init_mean) / max(float(del_grad_init_mean), float(eps))
+    beta_eff = max(beta_floor, beta_adaptive_nogate)
 
     adaptive_beta_state.update({
         'pos_grad_ema': float(pos_grad_ema),
@@ -255,7 +271,14 @@ def _update_adaptive_beta_state(
         'fit_mse_ref': float(fit_mse_ref),
         'fit_quality': float(fit_quality),
         'gate': float(gate),
-        'beta_ratio': float(beta_ratio),
+        'beta_ratio': float(beta_adaptive_nogate),
+        'beta_adaptive_nogate': float(beta_adaptive_nogate),
+        'beta_floor': float(beta_floor),
+        'beta_floor_count': int(beta_floor_count),
+        'beta_floor_pos_sum': float(beta_floor_pos_sum),
+        'beta_floor_del_sum': float(beta_floor_del_sum),
+        'pos_grad_init_mean': float(pos_grad_init_mean),
+        'del_grad_init_mean': float(del_grad_init_mean),
         'beta_eff': float(beta_eff),
     })
     return adaptive_beta_state
@@ -274,6 +297,11 @@ def _current_adaptive_beta_terms(
             'fit_mse_ema': 0.0,
             'fit_mse_ref': 0.0,
             'beta_ratio': 0.0,
+            'beta_adaptive_nogate': 0.0,
+            'beta_floor': 0.0,
+            'beta_floor_count': 0,
+            'pos_grad_init_mean': 0.0,
+            'del_grad_init_mean': 0.0,
         }
     return {
         'beta_eff': float(adaptive_beta_state.get('beta_eff', 0.0)),
@@ -284,6 +312,11 @@ def _current_adaptive_beta_terms(
         'fit_mse_ema': float(adaptive_beta_state.get('fit_mse_ema', 0.0)),
         'fit_mse_ref': float(adaptive_beta_state.get('fit_mse_ref', 0.0)),
         'beta_ratio': float(adaptive_beta_state.get('beta_ratio', 0.0)),
+        'beta_adaptive_nogate': float(adaptive_beta_state.get('beta_adaptive_nogate', 0.0)),
+        'beta_floor': float(adaptive_beta_state.get('beta_floor', 0.0)),
+        'beta_floor_count': int(adaptive_beta_state.get('beta_floor_count', 0)),
+        'pos_grad_init_mean': float(adaptive_beta_state.get('pos_grad_init_mean', 0.0)),
+        'del_grad_init_mean': float(adaptive_beta_state.get('del_grad_init_mean', 0.0)),
     }
 
 
@@ -322,6 +355,37 @@ def freeze_for_route_f(
 
 def get_trainable_parameters(model: ObjectDynamicsDLP):
     return [p for p in model.parameters() if p.requires_grad]
+
+
+class IndexedDataset(Dataset):
+    """
+    Wrap a dataset so each sample carries its stable dataset index as the last
+    returned element. This lets us cache frozen anchors once and gather them by
+    index during training.
+    """
+
+    def __init__(self, dataset: Dataset):
+        self.dataset = dataset
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        if isinstance(item, tuple):
+            return item + (index,)
+        if isinstance(item, list):
+            return tuple(item) + (index,)
+        raise TypeError(f"IndexedDataset expects tuple/list items, got {type(item)!r}")
+
+
+def extract_sample_indices(batch) -> Optional[torch.Tensor]:
+    if isinstance(batch, (list, tuple)) and len(batch) >= 6:
+        sample_indices = batch[-1]
+        if torch.is_tensor(sample_indices):
+            return sample_indices.long()
+        return torch.as_tensor(sample_indices, dtype=torch.long)
+    return None
 
 
 def parse_monitor_modes(modes_csv: str) -> List[str]:
@@ -619,8 +683,8 @@ def _monitor_prob_encoder_eval_route(args) -> str:
         and args.trainable_attribute_set == 'position_scale_depth_obj_on'
         and args.position_head_training == 'full'
     ):
-        return 'c1-dyn-attrs'
-    return 'c1'
+        return 'c1-dyn-attrs' if args.route == 'f1' else 'c2-dyn-attrs'
+    return 'c1' if args.route == 'f1' else 'c2'
 
 
 def _alignment_metrics_to_record(
@@ -1164,6 +1228,77 @@ def latent_yx_to_d6_true_world(
     return torch.stack([x_world, y_world], dim=-1)
 
 
+def pixel_xy_to_d6_true_world(
+    pixel_xy: torch.Tensor,
+    args,
+) -> torch.Tensor:
+    """
+    Direct inverse renderer map from D6-TRUE-PIX pixel centres to D6-TRUE world coordinates.
+    """
+    if pixel_xy.shape[-1] != 2:
+        raise ValueError(f"Expected pixel_xy last dim=2, got shape={tuple(pixel_xy.shape)}")
+
+    height = float(args.dyn_image_height)
+    width = float(args.dyn_image_width)
+    radius = float(args.dyn_render_radius_px)
+    denom_x = max(width - 1.0 - 2.0 * radius, 1e-6)
+    denom_y = max(height - 1.0 - 2.0 * radius, 1e-6)
+
+    x_px = pixel_xy[..., 0]
+    y_px = pixel_xy[..., 1]
+
+    x_min = float(args.dyn_world_x_min)
+    x_max = float(args.dyn_world_x_max)
+    y_min = float(args.dyn_world_y_min)
+    y_max = float(args.dyn_world_y_max)
+
+    x_world = x_min + ((x_px - radius) / denom_x) * (x_max - x_min)
+    y_world = y_min + (1.0 - ((y_px - radius) / denom_y)) * (y_max - y_min)
+    return torch.stack([x_world, y_world], dim=-1)
+
+
+def raw_gt_positions_to_d6_true_world(
+    gt_xy: torch.Tensor,
+    args,
+) -> torch.Tensor:
+    """
+    Best-effort conversion of raw GT trajectories to D6-TRUE world coordinates.
+
+    The twobody Route-C datasets store pixel-centre trajectories in x/y order,
+    but this helper also handles zero-one and minus-one-one normalizations.
+    """
+    if gt_xy.shape[-1] != 2:
+        raise ValueError(f"Expected gt_xy last dim=2, got shape={tuple(gt_xy.shape)}")
+
+    gt = gt_xy.float()
+    gmin = float(gt.min().item())
+    gmax = float(gt.max().item())
+    mode = getattr(args, 'gt_normalization', 'auto')
+    image_size = float(getattr(args, 'dyn_image_width', 64))
+    pixel_denom = max(image_size - 1.0, 1.0)
+
+    if mode == 'zero_one' or (mode == 'auto' and gmin >= -0.1 and gmax <= 1.1):
+        pixel_xy = gt * pixel_denom
+        return pixel_xy_to_d6_true_world(pixel_xy, args)
+
+    if mode == 'minus_one_one' or (mode == 'none' and gmin >= -1.2 and gmax <= 1.2):
+        pixel_xy = 0.5 * (gt + 1.0) * pixel_denom
+        return pixel_xy_to_d6_true_world(pixel_xy, args)
+
+    world_x_min = float(args.dyn_world_x_min)
+    world_x_max = float(args.dyn_world_x_max)
+    world_y_min = float(args.dyn_world_y_min)
+    world_y_max = float(args.dyn_world_y_max)
+    if (
+        mode == 'none'
+        and gmin >= min(world_x_min, world_y_min) - 1.0
+        and gmax <= max(world_x_max, world_y_max) + 1.0
+    ):
+        return gt
+
+    return pixel_xy_to_d6_true_world(gt, args)
+
+
 def matched_latent_yx_to_d6_true_state(
     q_yx: torch.Tensor,
     args,
@@ -1188,44 +1323,58 @@ def matched_latent_yx_to_d6_true_state(
     return world_xy.reshape(world_xy.shape[0], world_xy.shape[1], -1)
 
 
+def xy_world_to_state(world_xy: torch.Tensor) -> torch.Tensor:
+    if world_xy.ndim != 4:
+        raise ValueError(f"Expected world_xy [B,T,N,2], got shape={tuple(world_xy.shape)}")
+    return world_xy.reshape(world_xy.shape[0], world_xy.shape[1], -1)
+
+
 def differentiable_del_residual(
     lagrangian_model: torch.nn.Module,
     q_prev: torch.Tensor,
     q_curr: torch.Tensor,
     q_next: torch.Tensor,
+    create_graph: bool = True,
 ) -> torch.Tensor:
     ld_prev = lagrangian_model(q_prev, q_curr)
     d2_prev = torch.autograd.grad(
         ld_prev.sum(),
         q_curr,
-        create_graph=True,
-        retain_graph=True,
+        create_graph=create_graph,
+        retain_graph=create_graph,
     )[0]
 
     ld_next = lagrangian_model(q_curr, q_next)
     d1_next = torch.autograd.grad(
         ld_next.sum(),
         q_curr,
-        create_graph=True,
-        retain_graph=True,
+        create_graph=create_graph,
+        retain_graph=create_graph,
     )[0]
     return d2_prev + d1_next
 
 
-def weak_del_residual_loss(
+def del_residual_sequence(
     lagrangian_model: torch.nn.Module,
     q_seq: torch.Tensor,
     weak_window: int = 0,
+    create_graph: bool = True,
 ) -> torch.Tensor:
     if q_seq.ndim != 3:
         raise ValueError(f"Expected q_seq [B,T,D], got shape={tuple(q_seq.shape)}")
     if q_seq.shape[1] < 3:
-        return q_seq.new_tensor(0.0)
+        return q_seq.new_zeros((q_seq.shape[0], 0, q_seq.shape[-1]))
 
     q_prev = q_seq[:, :-2, :]
     q_curr = q_seq[:, 1:-1, :]
     q_next = q_seq[:, 2:, :]
-    residual = differentiable_del_residual(lagrangian_model, q_prev, q_curr, q_next)
+    residual = differentiable_del_residual(
+        lagrangian_model,
+        q_prev,
+        q_curr,
+        q_next,
+        create_graph=create_graph,
+    )
 
     if weak_window > 0 and residual.shape[1] > 1:
         kernel_size = 2 * int(weak_window) + 1
@@ -1235,8 +1384,173 @@ def weak_del_residual_loss(
         padded = torch.nn.functional.pad(res_ch, (pad, pad), mode='replicate')
         kernel = residual.new_full((channels, 1, kernel_size), 1.0 / float(kernel_size))
         residual = torch.nn.functional.conv1d(padded, kernel, groups=channels).transpose(1, 2)
+    return residual
 
+
+def weak_del_residual_loss(
+    lagrangian_model: torch.nn.Module,
+    q_seq: torch.Tensor,
+    weak_window: int = 0,
+) -> torch.Tensor:
+    residual = del_residual_sequence(
+        lagrangian_model=lagrangian_model,
+        q_seq=q_seq,
+        weak_window=weak_window,
+    )
+    if residual.shape[1] == 0:
+        return q_seq.new_tensor(0.0)
     return residual.pow(2).sum(dim=-1).mean()
+
+
+def diagnostic_weak_del_residual_loss(
+    lagrangian_model: Optional[torch.nn.Module],
+    q_seq: Optional[torch.Tensor],
+    weak_window: int = 0,
+) -> Optional[torch.Tensor]:
+    if lagrangian_model is None or q_seq is None:
+        return None
+    with torch.enable_grad():
+        q_detached = q_seq.detach().requires_grad_(True)
+        residual = del_residual_sequence(
+            lagrangian_model=lagrangian_model,
+            q_seq=q_detached,
+            weak_window=weak_window,
+            create_graph=False,
+        )
+        if residual.shape[1] == 0:
+            loss = q_seq.new_tensor(0.0)
+        else:
+            loss = residual.pow(2).sum(dim=-1).mean()
+    return loss.detach()
+
+
+def mean_state_squared_error(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if a is None or b is None:
+        return None
+    if a.shape != b.shape:
+        raise ValueError(f"State-shape mismatch: {tuple(a.shape)} vs {tuple(b.shape)}")
+    return ((a - b) ** 2).sum(dim=-1).mean()
+
+
+def whiten_del_residual(
+    residual: torch.Tensor,
+    residual_normalizer: Optional[Dict[str, torch.Tensor]],
+) -> torch.Tensor:
+    if residual_normalizer is None:
+        return residual
+    mean = residual_normalizer['mean'].to(device=residual.device, dtype=residual.dtype)
+    whitener = residual_normalizer['whitener'].to(device=residual.device, dtype=residual.dtype)
+    centered = residual - mean.view(1, 1, -1)
+    return torch.matmul(centered, whitener.transpose(0, 1))
+
+
+def normalized_del_residual_loss(
+    lagrangian_model: torch.nn.Module,
+    q_theta_seq: torch.Tensor,
+    q0_seq: torch.Tensor,
+    residual_normalizer: Optional[Dict[str, torch.Tensor]],
+    weak_window: int = 0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    theta_residual = del_residual_sequence(
+        lagrangian_model=lagrangian_model,
+        q_seq=q_theta_seq,
+        weak_window=weak_window,
+    )
+    if theta_residual.shape[1] == 0:
+        return q_theta_seq.new_tensor(0.0)
+
+    with torch.enable_grad():
+        q0_detached = q0_seq.detach().requires_grad_(True)
+        baseline_residual = del_residual_sequence(
+            lagrangian_model=lagrangian_model,
+            q_seq=q0_detached,
+            weak_window=weak_window,
+            create_graph=False,
+        ).detach()
+
+    theta_whitened = whiten_del_residual(theta_residual, residual_normalizer)
+    baseline_whitened = whiten_del_residual(baseline_residual, residual_normalizer)
+
+    # Average squared residual coordinates per triplet, then normalize each
+    # sequence against the detached baseline sequence energy. If a residual
+    # normalizer is provided, these are whitened coordinates; otherwise the raw
+    # residual coordinates are used.
+    theta_seq_energy = theta_whitened.pow(2).mean(dim=-1).mean(dim=1)
+    baseline_seq_energy = baseline_whitened.pow(2).mean(dim=-1).mean(dim=1).detach()
+    return (theta_seq_energy / (baseline_seq_energy + float(eps))).mean()
+
+
+def precompute_del_residual_normalizer(
+    lagrangian_model: Optional[torch.nn.Module],
+    dataset: Dataset,
+    device: torch.device,
+    args,
+    batch_size: int,
+    num_workers: int,
+    desc: str,
+) -> Optional[Dict[str, torch.Tensor]]:
+    if lagrangian_model is None:
+        return None
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=True,
+    )
+
+    residual_sum = None
+    residual_outer = None
+    count = 0
+    state_dim = None
+
+    for batch in tqdm(loader, desc=desc):
+        gt_pos_raw = torch.as_tensor(batch[1], device=device, dtype=torch.float32)
+        q_true_world = xy_world_to_state(raw_gt_positions_to_d6_true_world(gt_pos_raw, args))
+        with torch.enable_grad():
+            q_detached = q_true_world.detach().requires_grad_(True)
+            residual = del_residual_sequence(
+                lagrangian_model=lagrangian_model,
+                q_seq=q_detached,
+                weak_window=args.dyn_weak_window,
+                create_graph=False,
+            ).detach()
+
+        if residual.shape[1] == 0:
+            continue
+        flat = residual.reshape(-1, residual.shape[-1]).double().cpu()
+        if flat.numel() == 0:
+            continue
+        if residual_sum is None:
+            state_dim = int(flat.shape[-1])
+            residual_sum = torch.zeros(state_dim, dtype=torch.float64)
+            residual_outer = torch.zeros((state_dim, state_dim), dtype=torch.float64)
+        residual_sum += flat.sum(dim=0)
+        residual_outer += flat.transpose(0, 1).matmul(flat)
+        count += int(flat.shape[0])
+
+    if count <= 0 or residual_sum is None or residual_outer is None or state_dim is None:
+        raise RuntimeError("Could not compute DEL residual normalizer: no residual triplets were collected.")
+
+    mean = residual_sum / float(count)
+    cov = residual_outer / float(count) - torch.outer(mean, mean)
+    cov = 0.5 * (cov + cov.transpose(0, 1))
+    ridge = float(args.dyn_whiten_ridge)
+    cov_reg = cov + ridge * torch.eye(state_dim, dtype=torch.float64)
+    evals, evecs = torch.linalg.eigh(cov_reg)
+    evals = evals.clamp_min(max(ridge, 1e-12))
+    inv_sqrt = evecs @ torch.diag(evals.rsqrt()) @ evecs.transpose(0, 1)
+
+    return {
+        'mean': mean.float(),
+        'cov': cov.float(),
+        'whitener': inv_sqrt.float(),
+        'num_triplets': int(count),
+        'ridge': ridge,
+    }
 
 
 def encode_sequential(model: ObjectDynamicsDLP, x: torch.Tensor, num_static_frames: int):
@@ -1269,59 +1583,163 @@ def build_route_mean(
     route: str,
     train_out: Dict[str, torch.Tensor],
     frozen_out: Optional[Dict[str, torch.Tensor]],
+    cached_frozen_nominal: Optional[torch.Tensor],
+    cached_route_baseline: Optional[torch.Tensor],
     recenter_source: str,
     recenter_eps: float,
     f1_delta_mode: str,
     kp_min: float,
     kp_max: float,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     mu_nom_train = train_out['z_base'] + train_out['mu_offset']
 
-    if route != 'f1':
-        raise ValueError("Route F.2/C2 has been removed; only route='f1' is supported.")
+    mu_nom_frozen = None
+    route_baseline = None
+    if cached_frozen_nominal is not None:
+        mu_nom_frozen = cached_frozen_nominal
+        route_baseline = cached_route_baseline
+    elif frozen_out is not None:
+        mu_nom_frozen = frozen_out['z_base'] + frozen_out['mu_offset']
 
-    if frozen_out is None:
-        raise RuntimeError("Route F.1 requires frozen_out")
+        if route == 'f1':
+            if recenter_source == 'patch_alpha':
+                route_baseline, _ = recenter_patch_alpha(
+                    mu_nom_frozen,
+                    frozen_out['mu_scale'],
+                    frozen_out['dec_objects_original'],
+                    eps=recenter_eps,
+                )
+            elif recenter_source == 'global_alpha':
+                route_baseline, _ = recenter_global_alpha(
+                    mu_nom_frozen,
+                    frozen_out['alpha_masks'],
+                    eps=recenter_eps,
+                )
+            else:
+                raise ValueError(f"Unknown recenter_source: {recenter_source}")
 
-    mu_nom_frozen = frozen_out['z_base'] + frozen_out['mu_offset']
+            route_baseline = route_baseline.detach()
 
-    if recenter_source == 'patch_alpha':
-        c0, _ = recenter_patch_alpha(
-            mu_nom_frozen,
-            frozen_out['mu_scale'],
-            frozen_out['dec_objects_original'],
-            eps=recenter_eps,
-        )
-    elif recenter_source == 'global_alpha':
-        c0, _ = recenter_global_alpha(
-            mu_nom_frozen,
-            frozen_out['alpha_masks'],
-            eps=recenter_eps,
-        )
+    if route == 'f1':
+        if mu_nom_frozen is None or route_baseline is None:
+            raise RuntimeError("Route F.1/C1 requires frozen_out or cached frozen anchors")
+        if f1_delta_mode == 'relative_to_frozen_nominal':
+            delta = mu_nom_train - mu_nom_frozen.detach()
+        elif f1_delta_mode == 'direct_trainable_nominal':
+            delta = mu_nom_train
+        else:
+            raise ValueError(f"Unknown f1_delta_mode: {f1_delta_mode}")
+        pred_mean = (route_baseline + delta).clamp(min=kp_min, max=kp_max)
+        baseline_mean = route_baseline.detach()
+    elif route == 'c2':
+        pred_mean = mu_nom_train.clamp(min=kp_min, max=kp_max)
+        baseline_mean = mu_nom_frozen.detach() if mu_nom_frozen is not None else None
     else:
-        raise ValueError(f"Unknown recenter_source: {recenter_source}")
+        raise ValueError(f"Unknown route: {route}. Expected one of ['f1', 'c2'].")
 
-    c0 = c0.detach()
+    return pred_mean, {
+        'baseline_mean': baseline_mean,
+        'mu_nom_frozen': mu_nom_frozen.detach() if mu_nom_frozen is not None else None,
+    }
 
-    if f1_delta_mode == 'relative_to_frozen_nominal':
-        delta = mu_nom_train - mu_nom_frozen.detach()
-    elif f1_delta_mode == 'direct_trainable_nominal':
-        delta = mu_nom_train
-    else:
-        raise ValueError(f"Unknown f1_delta_mode: {f1_delta_mode}")
 
-    return (c0 + delta).clamp(min=kp_min, max=kp_max)
+def precompute_frozen_anchor_cache(
+    frozen_model: ObjectDynamicsDLP,
+    indexed_dataset: Dataset,
+    device: torch.device,
+    args,
+    batch_size: int,
+    num_workers: int,
+    desc: str,
+):
+    if frozen_model is None:
+        return None
+
+    total = len(indexed_dataset)
+    if total == 0:
+        raise RuntimeError(f"Cannot precompute frozen anchors for empty dataset: {desc}")
+
+    loader = DataLoader(
+        indexed_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=True,
+    )
+
+    cache_nominal = None
+    cache_route_baseline = None
+    frozen_model.eval()
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=desc):
+            sample_indices = extract_sample_indices(batch)
+            if sample_indices is None:
+                raise RuntimeError(
+                    "Frozen anchor precompute requires batches with dataset indices. "
+                    "Wrap the dataset with IndexedDataset before caching."
+                )
+            sample_indices = sample_indices.cpu().long()
+            x = batch[0].to(device, non_blocking=True)
+
+            frozen_out = encode_sequential(frozen_model, x, num_static_frames=args.num_static_frames)
+            mu_nom_frozen = frozen_out['z_base'] + frozen_out['mu_offset']
+
+            mu_nom_cpu = mu_nom_frozen.detach().cpu()
+            route_baseline_cpu = None
+            if args.route == 'f1':
+                if args.recenter_source == 'patch_alpha':
+                    route_baseline, _ = recenter_patch_alpha(
+                        mu_nom_frozen,
+                        frozen_out['mu_scale'],
+                        frozen_out['dec_objects_original'],
+                        eps=args.recenter_eps,
+                    )
+                elif args.recenter_source == 'global_alpha':
+                    route_baseline, _ = recenter_global_alpha(
+                        mu_nom_frozen,
+                        frozen_out['alpha_masks'],
+                        eps=args.recenter_eps,
+                    )
+                else:
+                    raise ValueError(f"Unknown recenter_source: {args.recenter_source}")
+                route_baseline_cpu = route_baseline.detach().cpu()
+
+            if cache_nominal is None:
+                cache_nominal = torch.empty((total,) + tuple(mu_nom_cpu.shape[1:]), dtype=mu_nom_cpu.dtype)
+                if route_baseline_cpu is not None:
+                    cache_route_baseline = torch.empty(
+                        (total,) + tuple(route_baseline_cpu.shape[1:]),
+                        dtype=route_baseline_cpu.dtype,
+                    )
+
+            cache_nominal[sample_indices] = mu_nom_cpu
+            if route_baseline_cpu is not None:
+                cache_route_baseline[sample_indices] = route_baseline_cpu
+
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    out = {
+        'mu_nom_frozen': cache_nominal.pin_memory(),
+    }
+    if cache_route_baseline is not None:
+        out['route_baseline'] = cache_route_baseline.pin_memory()
+    return out
 
 
 def one_pass(
     model: ObjectDynamicsDLP,
     frozen_model: Optional[ObjectDynamicsDLP],
+    frozen_anchor_cache: Optional[Dict[str, torch.Tensor]],
     batch,
     device: torch.device,
     args,
     config: Dict,
     gt_similarity_transform: Optional[Dict[str, object]] = None,
     lagrangian_model: Optional[torch.nn.Module] = None,
+    residual_normalizer: Optional[Dict[str, torch.Tensor]] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     grad_masks: Optional[Dict[torch.nn.Parameter, torch.Tensor]] = None,
     adaptive_beta_state: Optional[Dict[str, float]] = None,
@@ -1331,12 +1749,14 @@ def one_pass(
     train_mode = optimizer is not None
 
     x = batch[0].to(device)
+    sample_indices = extract_sample_indices(batch)
     if len(batch) < 2:
         raise RuntimeError(
             "Dataset batch does not contain ground-truth positions at index 1. "
             "This trainer requires video+trajectory datasets."
         )
-    gt_pos = torch.as_tensor(batch[1], device=device, dtype=torch.float32)
+    gt_pos_raw = torch.as_tensor(batch[1], device=device, dtype=torch.float32)
+    gt_pos = gt_pos_raw
     in_cam = None
     if args.use_in_camera_mask and len(batch) >= 5:
         in_cam = torch.as_tensor(batch[4], device=device, dtype=torch.float32)
@@ -1353,23 +1773,41 @@ def one_pass(
     train_out = encode_sequential(model, x, num_static_frames=args.num_static_frames)
 
     frozen_out = None
-    if args.route == 'f1':
-        if frozen_model is None:
-            raise RuntimeError("Route F.1 requested but frozen model is missing")
+    cached_frozen_nominal = None
+    cached_route_baseline = None
+    if frozen_anchor_cache is not None and sample_indices is not None:
+        sample_indices = sample_indices.cpu().long()
+        cached_frozen_nominal = frozen_anchor_cache['mu_nom_frozen'].index_select(0, sample_indices).to(
+            device,
+            non_blocking=True,
+        )
+        if 'route_baseline' in frozen_anchor_cache:
+            cached_route_baseline = frozen_anchor_cache['route_baseline'].index_select(0, sample_indices).to(
+                device,
+                non_blocking=True,
+            )
+    elif frozen_model is not None and (args.route == 'f1' or args.objective == 'c1_dyn'):
         with torch.no_grad():
             frozen_out = encode_sequential(frozen_model, x, num_static_frames=args.num_static_frames)
+    elif args.route == 'f1':
+        raise RuntimeError("Route F.1/C1 requested but frozen model/cache is missing")
 
     kp_min, kp_max = float(config['kp_range'][0]), float(config['kp_range'][1])
-    pred_mean = build_route_mean(
+    pred_mean, route_components = build_route_mean(
         route=args.route,
         train_out=train_out,
         frozen_out=frozen_out,
+        cached_frozen_nominal=cached_frozen_nominal,
+        cached_route_baseline=cached_route_baseline,
         recenter_source=args.recenter_source,
         recenter_eps=args.recenter_eps,
         f1_delta_mode=args.f1_delta_mode,
         kp_min=kp_min,
         kp_max=kp_max,
     )
+    q0_mean = route_components['baseline_mean']
+    if q0_mean is not None:
+        q0_mean = q0_mean.clamp(min=kp_min, max=kp_max)
     pred_logvar = train_out['logvar_offset']
 
     # Optional detached temporal reordering (before sequence-level Hungarian).
@@ -1379,37 +1817,66 @@ def one_pass(
         perms = compute_temporal_permutations(pred_mean.detach(), reorder_method)
         pred_mean = apply_temporal_permutation(pred_mean, perms)
         pred_logvar = apply_temporal_permutation(pred_logvar, perms)
+        if q0_mean is not None:
+            q0_perms = compute_temporal_permutations(q0_mean.detach(), reorder_method)
+            q0_mean = apply_temporal_permutation(q0_mean, q0_perms)
 
     # Sequence-level Hungarian matching (pred slots -> GT identities).
     seq_assign = sequence_level_hungarian_assign(pred_mean.detach(), gt_pos.detach(), gt_mask=in_cam)
     pred_mean = gather_slots(pred_mean, seq_assign)
     pred_logvar = gather_slots(pred_logvar, seq_assign)
+    if q0_mean is not None:
+        q0_assign = sequence_level_hungarian_assign(q0_mean.detach(), gt_pos.detach(), gt_mask=in_cam)
+        q0_mean = gather_slots(q0_mean, q0_assign)
 
     # Gaussian NLL with DDLP position posterior variance.
     position_loss, mse = gaussian_nll(pred_mean, pred_logvar, gt_pos, mask=in_cam)
     dynamics_loss = pred_mean.new_tensor(0.0)
+    q_dyn = None
     beta_eff = 0.0
     beta_gate = 0.0
     fit_quality = 0.0
     pos_grad_norm = 0.0
     del_grad_norm = 0.0
     beta_ratio = 0.0
+    beta_adaptive_nogate = 0.0
+    beta_floor = 0.0
+    beta_floor_count = 0
+    pos_grad_init_mean = 0.0
+    del_grad_init_mean = 0.0
     pos_grad_ema = 0.0
     del_grad_ema = 0.0
     fit_mse_ema = 0.0
     fit_mse_ref = 0.0
-    if args.objective == 'c1_dyn' and compute_dynamics_loss:
-        if lagrangian_model is None:
-            raise RuntimeError("objective='c1_dyn' requires a loaded fixed Lagrangian model")
-        q_dyn = matched_latent_yx_to_d6_true_state(
-            pred_mean,
+    q0_world = None
+    if q0_mean is not None:
+        q0_world = matched_latent_yx_to_d6_true_state(
+            q0_mean.detach(),
             args,
             gt_similarity_transform=gt_similarity_transform,
         )
-        dynamics_loss = weak_del_residual_loss(
+    q_theta_world = matched_latent_yx_to_d6_true_state(
+        pred_mean,
+        args,
+        gt_similarity_transform=gt_similarity_transform,
+    )
+
+    if args.objective == 'c1_dyn' and compute_dynamics_loss:
+        if lagrangian_model is None:
+            raise RuntimeError("objective='c1_dyn' requires a loaded fixed Lagrangian model")
+        if q0_world is None:
+            raise RuntimeError(
+                "objective='c1_dyn' requires an initialization baseline q0 for DEL normalization, "
+                f"but route={args.route!r} did not provide one."
+            )
+        q_dyn = q_theta_world
+        dynamics_loss = normalized_del_residual_loss(
             lagrangian_model=lagrangian_model,
-            q_seq=q_dyn,
+            q_theta_seq=q_dyn,
+            q0_seq=q0_world,
+            residual_normalizer=residual_normalizer,
             weak_window=args.dyn_weak_window,
+            eps=float(args.dyn_norm_eps),
         )
 
     if args.objective == 'c1_dyn':
@@ -1426,6 +1893,8 @@ def one_pass(
             beta_terms = _update_adaptive_beta_state(
                 adaptive_beta_state,
                 c=float(args.beta),
+                floor_rho=float(args.beta_floor_rho),
+                floor_warmup_steps=int(args.beta_floor_warmup_steps),
                 ema_decay=float(args.beta_ema_decay),
                 eps=float(args.beta_eps),
                 position_mse=float(mse.detach().cpu().item()),
@@ -1439,6 +1908,11 @@ def one_pass(
         beta_gate = float(beta_terms['gate'])
         fit_quality = float(beta_terms['fit_quality'])
         beta_ratio = float(beta_terms['beta_ratio'])
+        beta_adaptive_nogate = float(beta_terms['beta_adaptive_nogate'])
+        beta_floor = float(beta_terms['beta_floor'])
+        beta_floor_count = int(beta_terms['beta_floor_count'])
+        pos_grad_init_mean = float(beta_terms['pos_grad_init_mean'])
+        del_grad_init_mean = float(beta_terms['del_grad_init_mean'])
         pos_grad_ema = float(beta_terms['pos_grad_ema'])
         del_grad_ema = float(beta_terms['del_grad_ema'])
         fit_mse_ema = float(beta_terms['fit_mse_ema'])
@@ -1463,6 +1937,48 @@ def one_pass(
             mae = mean_abs_err.sum(dim=-1).mean()
         mean_std = torch.exp(0.5 * pred_logvar).mean()
 
+        q_target_world = matched_latent_yx_to_d6_true_state(
+            gt_pos.detach(),
+            args,
+            gt_similarity_transform=gt_similarity_transform,
+        )
+        q_true_world = xy_world_to_state(
+            raw_gt_positions_to_d6_true_world(gt_pos_raw.detach(), args)
+        )
+        if q0_world is not None:
+            q0_world = q0_world.detach()
+        q_theta_world = q_theta_world.detach()
+        world_mse_t_q_theta_vs_q_true_world = mean_state_squared_error(q_theta_world, q_true_world)
+
+    residual_q_true_world = diagnostic_weak_del_residual_loss(
+        lagrangian_model=lagrangian_model,
+        q_seq=q_true_world,
+        weak_window=args.dyn_weak_window,
+    )
+    residual_t_q_target = diagnostic_weak_del_residual_loss(
+        lagrangian_model=lagrangian_model,
+        q_seq=q_target_world,
+        weak_window=args.dyn_weak_window,
+    )
+    residual_t_q0 = diagnostic_weak_del_residual_loss(
+        lagrangian_model=lagrangian_model,
+        q_seq=q0_world,
+        weak_window=args.dyn_weak_window,
+    )
+    residual_t_q_theta = diagnostic_weak_del_residual_loss(
+        lagrangian_model=lagrangian_model,
+        q_seq=q_theta_world,
+        weak_window=args.dyn_weak_window,
+    )
+    residual_delta_q_theta_minus_q0 = None
+    if residual_t_q_theta is not None and residual_t_q0 is not None:
+        residual_delta_q_theta_minus_q0 = residual_t_q_theta - residual_t_q0
+
+    def _metric_or_zero(x: Optional[torch.Tensor]) -> float:
+        if x is None:
+            return 0.0
+        return float(x.detach().cpu().item())
+
     out = {
         'loss': float(loss.detach().cpu().item()),
         'position_loss': float(position_loss.detach().cpu().item()),
@@ -1475,12 +1991,23 @@ def one_pass(
         'beta_gate': float(beta_gate),
         'fit_quality': float(fit_quality),
         'beta_ratio': float(beta_ratio),
+        'beta_adaptive_nogate': float(beta_adaptive_nogate),
+        'beta_floor': float(beta_floor),
+        'beta_floor_count': int(beta_floor_count),
         'pos_grad_norm': float(pos_grad_norm),
         'del_grad_norm': float(del_grad_norm),
+        'pos_grad_init_mean': float(pos_grad_init_mean),
+        'del_grad_init_mean': float(del_grad_init_mean),
         'pos_grad_ema': float(pos_grad_ema),
         'del_grad_ema': float(del_grad_ema),
         'fit_mse_ema': float(fit_mse_ema),
         'fit_mse_ref': float(fit_mse_ref),
+        'diag_res_q_true_world': _metric_or_zero(residual_q_true_world),
+        'diag_res_t_q_target': _metric_or_zero(residual_t_q_target),
+        'diag_res_t_q0': _metric_or_zero(residual_t_q0),
+        'diag_res_t_q_theta': _metric_or_zero(residual_t_q_theta),
+        'diag_world_mse_t_q_theta_vs_q_true_world': _metric_or_zero(world_mse_t_q_theta_vs_q_true_world),
+        'diag_res_delta_q_theta_minus_q0': _metric_or_zero(residual_delta_q_theta_minus_q0),
     }
     if return_trajectories:
         out['pred_mean'] = pred_mean.detach().cpu()
@@ -1491,6 +2018,7 @@ def one_pass(
 def collect_visualization_samples(
     model: ObjectDynamicsDLP,
     frozen_model: Optional[ObjectDynamicsDLP],
+    frozen_anchor_cache: Optional[Dict[str, torch.Tensor]],
     loader: DataLoader,
     device: torch.device,
     args,
@@ -1508,6 +2036,7 @@ def collect_visualization_samples(
             metrics = one_pass(
                 model=model,
                 frozen_model=frozen_model,
+                frozen_anchor_cache=frozen_anchor_cache,
                 batch=batch,
                 device=device,
                 args=args,
@@ -1530,6 +2059,7 @@ def collect_visualization_samples(
 def collect_visualization_samples_and_metrics(
     model: ObjectDynamicsDLP,
     frozen_model: Optional[ObjectDynamicsDLP],
+    frozen_anchor_cache: Optional[Dict[str, torch.Tensor]],
     loader: DataLoader,
     device: torch.device,
     args,
@@ -1554,6 +2084,7 @@ def collect_visualization_samples_and_metrics(
             metrics = one_pass(
                 model=model,
                 frozen_model=frozen_model,
+                frozen_anchor_cache=frozen_anchor_cache,
                 batch=batch,
                 device=device,
                 args=args,
@@ -1730,32 +2261,54 @@ def _append_monitor_metrics_txt(
 
 
 def _monitor_run_label(args) -> str:
+    if getattr(args, 'run_label', None):
+        return str(args.run_label)
     if getattr(args, 'output_dir', None):
         return os.path.basename(os.path.normpath(args.output_dir))
     return f"{args.route}_{args.objective}_{args.trainable_attribute_set}"
 
 
 def _default_output_label(args) -> str:
-    if (
-        args.objective == 'position_nll'
-        and args.trainable_attribute_set == 'position_only'
-        and args.position_head_training == 'mean_only'
-    ):
-        return 'c1'
-    if (
-        args.objective == 'c1_dyn'
-        and args.trainable_attribute_set == 'position_only'
-        and args.position_head_training == 'mean_only'
-    ):
-        return 'c1_dyn'
-    if (
-        args.objective == 'c1_dyn'
-        and args.trainable_attribute_set == 'position_scale_depth_obj_on'
-        and args.position_head_training == 'full'
-    ):
-        return 'c1_dyn_full'
+    if args.route == 'f1':
+        if (
+            args.objective == 'position_nll'
+            and args.trainable_attribute_set == 'position_only'
+            and args.position_head_training == 'mean_only'
+        ):
+            return 'c1'
+        if (
+            args.objective == 'c1_dyn'
+            and args.trainable_attribute_set == 'position_only'
+            and args.position_head_training == 'mean_only'
+        ):
+            return 'c1_dyn'
+        if (
+            args.objective == 'c1_dyn'
+            and args.trainable_attribute_set == 'position_scale_depth_obj_on'
+            and args.position_head_training == 'full'
+        ):
+            return 'c1_dyn_full'
+    if args.route == 'c2':
+        if (
+            args.objective == 'position_nll'
+            and args.trainable_attribute_set == 'position_only'
+            and args.position_head_training == 'mean_only'
+        ):
+            return 'c2'
+        if (
+            args.objective == 'c1_dyn'
+            and args.trainable_attribute_set == 'position_only'
+            and args.position_head_training == 'mean_only'
+        ):
+            return 'c2_dyn'
+        if (
+            args.objective == 'c1_dyn'
+            and args.trainable_attribute_set == 'position_scale_depth_obj_on'
+            and args.position_head_training == 'full'
+        ):
+            return 'c2_dyn_full'
     return (
-        f"{args.objective}_{args.trainable_attribute_set}"
+        f"{args.route}_{args.objective}_{args.trainable_attribute_set}"
         f"_poshead_{args.position_head_training}"
     )
 
@@ -1763,6 +2316,7 @@ def _default_output_label(args) -> str:
 def write_periodic_visualization_snapshot(
     model: ObjectDynamicsDLP,
     frozen_model: Optional[ObjectDynamicsDLP],
+    monitor_anchor_caches: Dict[str, Optional[Dict[str, torch.Tensor]]],
     monitor_loaders: Dict[str, DataLoader],
     device: torch.device,
     args,
@@ -1796,6 +2350,7 @@ def write_periodic_visualization_snapshot(
         monitor_out = collect_visualization_samples_and_metrics(
             model=model,
             frozen_model=frozen_model,
+            frozen_anchor_cache=monitor_anchor_caches.get(mode),
             loader=loader,
             device=device,
             args=args,
@@ -1838,33 +2393,6 @@ def write_periodic_visualization_snapshot(
                     f"r2={rec['r2_mean']:.4f}±{rec['r2_std']:.4f}"
                 )
 
-            try:
-                eval_monitor_out = collect_exact_eval_monitor_metrics(
-                    model=model,
-                    frozen_model=frozen_model,
-                    device=device,
-                    args=args,
-                    config=config,
-                    mode=mode,
-                )
-            except Exception as exc:
-                print(
-                    f"[monitor] Warning: exact evaluation-path metrics failed for mode={mode}. "
-                    f"Error: {exc}"
-                )
-                eval_monitor_out = None
-
-            if eval_monitor_out is not None:
-                records.extend(eval_monitor_out['records'])
-                for rec in eval_monitor_out['records']:
-                    print(
-                        f"[monitor] mode={mode} | family={rec['metric_family']} | "
-                        f"matching={rec['matching']} | videos={rec['num_videos']} | "
-                        f"batches={rec['num_batches']} | "
-                        f"pearson_acc={rec['pearson_acc_mean']:.4f}±{rec['pearson_acc_std']:.4f} | "
-                        f"acc_rms={rec['acc_rms_ratio_mean']:.4f}±{rec['acc_rms_ratio_std']:.4f} | "
-                        f"r2={rec['r2_mean']:.4f}±{rec['r2_std']:.4f}"
-                    )
         else:
             print(
                 f"[monitor] mode={mode}: wrote {len(samples)} GIFs | "
@@ -1885,15 +2413,86 @@ def write_periodic_visualization_snapshot(
         print(f"[monitor] updated metrics log: {metrics_txt_path}")
 
 
+def write_exact_eval_monitor_snapshot(
+    model: ObjectDynamicsDLP,
+    frozen_model: Optional[ObjectDynamicsDLP],
+    monitor_modes: List[str],
+    device: torch.device,
+    args,
+    config: Dict,
+    checkpoint_dir: str,
+    epoch: int,
+    global_step: int,
+) -> None:
+    if len(monitor_modes) == 0:
+        return
+
+    run_label = _monitor_run_label(args)
+    route_root = getattr(args, 'output_dir', None)
+    if route_root is None:
+        route_root = os.path.join(checkpoint_dir, 'oracle', run_label)
+    vis_root = os.path.join(route_root, 'visualizations')
+    os.makedirs(vis_root, exist_ok=True)
+
+    print(
+        f"\n[monitor-exact] Running exact evaluation-path metrics at epoch={epoch} "
+        f"(step={global_step})"
+    )
+
+    records = []
+    for mode in monitor_modes:
+        try:
+            eval_monitor_out = collect_exact_eval_monitor_metrics(
+                model=model,
+                frozen_model=frozen_model,
+                device=device,
+                args=args,
+                config=config,
+                mode=mode,
+            )
+        except Exception as exc:
+            print(
+                f"[monitor-exact] Warning: exact evaluation-path metrics failed for mode={mode}. "
+                f"Error: {exc}"
+            )
+            continue
+
+        records.extend(eval_monitor_out['records'])
+        for rec in eval_monitor_out['records']:
+            print(
+                f"[monitor-exact] mode={mode} | family={rec['metric_family']} | "
+                f"matching={rec['matching']} | videos={rec['num_videos']} | "
+                f"batches={rec['num_batches']} | "
+                f"pearson_acc={rec['pearson_acc_mean']:.4f}±{rec['pearson_acc_std']:.4f} | "
+                f"acc_rms={rec['acc_rms_ratio_mean']:.4f}±{rec['acc_rms_ratio_std']:.4f} | "
+                f"r2={rec['r2_mean']:.4f}±{rec['r2_std']:.4f}"
+            )
+
+    if len(records) > 0:
+        metrics_txt_path = os.path.join(
+            vis_root,
+            f"monitor_metrics_v2_route_{run_label}.txt",
+        )
+        _append_monitor_metrics_txt(
+            metrics_txt_path=metrics_txt_path,
+            run_label=run_label,
+            global_step=global_step,
+            records=records,
+        )
+        print(f"[monitor-exact] updated metrics log: {metrics_txt_path}")
+
+
 def run_epoch(
     model: ObjectDynamicsDLP,
     frozen_model: Optional[ObjectDynamicsDLP],
+    frozen_anchor_cache: Optional[Dict[str, torch.Tensor]],
     loader: DataLoader,
     device: torch.device,
     args,
     config: Dict,
     gt_similarity_transform: Optional[Dict[str, object]] = None,
     lagrangian_model: Optional[torch.nn.Module] = None,
+    residual_normalizer: Optional[Dict[str, torch.Tensor]] = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     grad_masks: Optional[Dict[torch.nn.Parameter, torch.Tensor]] = None,
     adaptive_beta_state: Optional[Dict[str, float]] = None,
@@ -1916,12 +2515,23 @@ def run_epoch(
         'beta_gate': 0.0,
         'fit_quality': 0.0,
         'beta_ratio': 0.0,
+        'beta_adaptive_nogate': 0.0,
+        'beta_floor': 0.0,
+        'beta_floor_count': 0.0,
         'pos_grad_norm': 0.0,
         'del_grad_norm': 0.0,
+        'pos_grad_init_mean': 0.0,
+        'del_grad_init_mean': 0.0,
         'pos_grad_ema': 0.0,
         'del_grad_ema': 0.0,
         'fit_mse_ema': 0.0,
         'fit_mse_ref': 0.0,
+        'diag_res_q_true_world': 0.0,
+        'diag_res_t_q_target': 0.0,
+        'diag_res_t_q0': 0.0,
+        'diag_res_t_q_theta': 0.0,
+        'diag_world_mse_t_q_theta_vs_q_true_world': 0.0,
+        'diag_res_delta_q_theta_minus_q0': 0.0,
     }
     n = 0
     reorder_method_seen = None
@@ -1934,12 +2544,14 @@ def run_epoch(
         metrics = one_pass(
             model=model,
             frozen_model=frozen_model,
+            frozen_anchor_cache=frozen_anchor_cache,
             batch=batch,
             device=device,
             args=args,
             config=config,
             gt_similarity_transform=gt_similarity_transform,
             lagrangian_model=lagrangian_model,
+            residual_normalizer=residual_normalizer,
             optimizer=optimizer,
             grad_masks=grad_masks,
             adaptive_beta_state=adaptive_beta_state,
@@ -2007,16 +2619,26 @@ def parse_args():
     p.add_argument('--config_path', type=str, default=None,
                    help='Optional explicit config JSON path (defaults to <checkpoint_dir>/hparams.json).')
 
-    p.add_argument('--route', type=str, default='f1', choices=['f1'],
-                   help="Only route='f1' is supported. The former C2/F2 whole-latent route was removed.")
+    p.add_argument('--route', type=str, default='f1', choices=['f1', 'c2'],
+                   help="Oracle route: 'f1' is recentering-biased C1; 'c2' is pure direct position regression.")
     p.add_argument('--objective', type=str, default='position_nll', choices=['position_nll', 'c1_dyn'],
                    help='Training objective. c1_dyn adds a fixed DEL residual in D6-TRUE coordinates.')
     p.add_argument('--beta', type=float, default=1.0,
-                   help='Adaptive-beta scale c in beta_eff = gate(fit_quality) * c * EMA(||grad L_pos||) / (EMA(||grad L_del||) + eps).')
+                   help='Adaptive no-gate scale c in beta_adaptive = c * EMA(||grad L_pos||) / (EMA(||grad L_del||) + eps).')
+    p.add_argument('--beta_floor_rho', type=float, default=0.1,
+                   help='Gradient-matching floor coefficient rho in beta_floor = rho * g_pos_init / (g_del_init + eps).')
+    p.add_argument('--beta_floor_warmup_steps', type=int, default=25,
+                   help='Number of initial training steps used to estimate g_pos_init and g_del_init for beta_floor.')
     p.add_argument('--beta_ema_decay', type=float, default=0.95,
                    help='EMA decay used for fit-quality and gradient-norm tracking in adaptive beta_eff.')
     p.add_argument('--beta_eps', type=float, default=1e-8,
                    help='Numerical epsilon used in adaptive beta_eff and fit-quality computations.')
+    p.add_argument('--dyn_norm_eps', type=float, default=1e-8,
+                   help='Numerical epsilon used in the baseline-relative normalized DEL loss denominator.')
+    p.add_argument('--dyn_whitening', type=int, default=0,
+                   help='Use clean-residual whitening inside the normalized DEL loss (1/0). Default 0 keeps raw residual coordinates.')
+    p.add_argument('--dyn_whiten_ridge', type=float, default=1e-6,
+                   help='Diagonal ridge added to the clean DEL residual covariance before whitening.')
     p.add_argument('--trainable_attribute_set', type=str, default='position_only',
                    choices=['position_only', 'position_scale_depth_obj_on'],
                    help='Attribute heads to finetune. Features partition always remains fixed.')
@@ -2057,7 +2679,7 @@ def parse_args():
 
     p.add_argument('--lagrangian_checkpoint', type=str,
                    default='/data2/users/lr4617/discrete_lagrangian/del_pytorch/outputs/regularized/ghnn_generated_BIG_TRUE_matched_lam0p1',
-                   help='Fixed SeparableLagrangianMLP checkpoint file or directory used by objective=c1_dyn.')
+                   help='Fixed SeparableLagrangianMLP checkpoint file or directory used by objective=c1_dyn and residual diagnostics.')
     p.add_argument('--lagrangian_config_path', type=str, default=None,
                    help='Optional explicit config.json for the fixed Lagrangian checkpoint.')
     p.add_argument('--dyn_weak_window', type=int, default=0,
@@ -2090,11 +2712,15 @@ def parse_args():
 
     p.add_argument('--device', type=str, default='cuda:0')
     p.add_argument('--output_dir', type=str, default=None,
-                   help='Output directory for probabilistic encoder checkpoints/logs.')
+                   help='Route-level output directory. A timestamped run subdirectory is created inside it.')
     p.add_argument('--monitor_visualizations', type=int, default=1,
                    help='Enable periodic trajectory GIF snapshots during training (1/0).')
     p.add_argument('--monitor_every_steps', type=int, default=300,
-                   help='Write monitor visualizations every this many optimizer steps.')
+                   help='Deprecated compatibility flag. Step-based monitoring is no longer used.')
+    p.add_argument('--monitor_every_epochs', type=int, default=1,
+                   help='Write the lightweight monitor snapshot once every this many epochs.')
+    p.add_argument('--exact_eval_monitor_every_epochs', type=int, default=5,
+                   help='Run the expensive exact evaluation-path monitor once every this many epochs. Set to 0 to disable.')
     p.add_argument('--monitor_num_videos', type=int, default=10,
                    help='Number of videos (k) per dataset split for each monitor snapshot.')
     p.add_argument('--monitor_modes', type=str, default='train,valid,test',
@@ -2111,12 +2737,23 @@ def main():
     args.use_in_camera_mask = bool(args.use_in_camera_mask)
     args.swap_gt_xy = bool(args.swap_gt_xy)
     args.monitor_visualizations = bool(args.monitor_visualizations)
+    args.dyn_whitening = bool(args.dyn_whitening)
     if args.beta < 0.0:
         raise ValueError(f"beta must be non-negative, got {args.beta}")
+    if args.beta_floor_rho < 0.0:
+        raise ValueError(f"beta_floor_rho must be non-negative, got {args.beta_floor_rho}")
+    if args.beta_floor_warmup_steps <= 0:
+        raise ValueError(
+            f"beta_floor_warmup_steps must be > 0, got {args.beta_floor_warmup_steps}"
+        )
     if not (0.0 <= args.beta_ema_decay < 1.0):
         raise ValueError(f"beta_ema_decay must be in [0,1), got {args.beta_ema_decay}")
     if args.beta_eps <= 0.0:
         raise ValueError(f"beta_eps must be > 0, got {args.beta_eps}")
+    if args.dyn_norm_eps <= 0.0:
+        raise ValueError(f"dyn_norm_eps must be > 0, got {args.dyn_norm_eps}")
+    if args.dyn_whiten_ridge <= 0.0:
+        raise ValueError(f"dyn_whiten_ridge must be > 0, got {args.dyn_whiten_ridge}")
     if args.dyn_weak_window < 0:
         raise ValueError(f"dyn_weak_window must be >= 0, got {args.dyn_weak_window}")
     if args.dyn_image_width <= 1 or args.dyn_image_height <= 1:
@@ -2131,14 +2768,24 @@ def main():
                 "imageio is required because --monitor_visualizations 1. "
                 "Install imageio in this environment or pass --monitor_visualizations 0."
             )
-        if args.monitor_every_steps <= 0:
-            raise ValueError(f"monitor_every_steps must be > 0, got {args.monitor_every_steps}")
+        if args.monitor_every_epochs <= 0:
+            raise ValueError(f"monitor_every_epochs must be > 0, got {args.monitor_every_epochs}")
+        if args.exact_eval_monitor_every_epochs < 0:
+            raise ValueError(
+                "exact_eval_monitor_every_epochs must be >= 0, "
+                f"got {args.exact_eval_monitor_every_epochs}"
+            )
         if args.monitor_num_videos <= 0:
             raise ValueError(f"monitor_num_videos must be > 0, got {args.monitor_num_videos}")
         if args.monitor_max_batches <= 0:
             raise ValueError(f"monitor_max_batches must be > 0, got {args.monitor_max_batches}")
         if args.monitor_eval_seq_len <= 0:
             raise ValueError(f"monitor_eval_seq_len must be > 0, got {args.monitor_eval_seq_len}")
+        if args.monitor_every_steps not in {0, None, 300}:
+            print(
+                f"[monitor] Note: monitor_every_steps={args.monitor_every_steps} is deprecated "
+                "and ignored. Monitoring now runs on an epoch schedule."
+            )
         monitor_modes = parse_monitor_modes(args.monitor_modes)
 
     ckpt_path, checkpoint_dir = resolve_checkpoint_path(args.checkpoint, args.checkpoint_name)
@@ -2166,11 +2813,18 @@ def main():
     print(f"Config              : {config_path}")
     print(f"Dataset             : {config['ds']}")
     print(f"Data root           : {config['root']}")
-    print(f"Route               : {args.route} (C1 recentering-biased)")
+    route_desc = {
+        'f1': 'C1 recentering-biased',
+        'c2': 'C2 direct position regression',
+    }[args.route]
+    print(f"Route               : {args.route} ({route_desc})")
     print(f"Objective           : {args.objective}")
     print(f"Adaptive beta c     : {args.beta}")
+    print(f"Beta floor rho      : {args.beta_floor_rho}")
+    print(f"Beta floor warmup   : {args.beta_floor_warmup_steps}")
     print(f"Adaptive beta EMA   : {args.beta_ema_decay}")
     print(f"Adaptive beta eps   : {args.beta_eps}")
+    print(f"DEL whitening       : {args.dyn_whitening}")
     print(f"Trainable attrs     : {args.trainable_attribute_set}")
     print(f"Position head mode  : {args.position_head_training}")
     print(f"Temporal reorder    : {args.temporal_reorder}")
@@ -2189,7 +2843,7 @@ def main():
     lagrangian_ckpt_path = None
     lagrangian_config_path = None
     lagrangian_config = None
-    if args.objective == 'c1_dyn':
+    if args.lagrangian_checkpoint not in {None, ''}:
         lagrangian_model, lagrangian_ckpt_path, lagrangian_config_path, lagrangian_config = load_fixed_lagrangian(
             checkpoint_path_or_dir=args.lagrangian_checkpoint,
             explicit_config_path=args.lagrangian_config_path,
@@ -2219,9 +2873,9 @@ def main():
         if p.requires_grad:
             print(f"  - {name}: shape={tuple(p.shape)}")
 
-    # Frozen reference checkpoint for Route F.1 recentering bias computation.
+    # Frozen reference checkpoint / baseline cache for routes that use c0.
     frozen_model = None
-    if args.route == 'f1':
+    if args.route == 'f1' or args.objective == 'c1_dyn':
         frozen_model = deepcopy(model).to(device)
         frozen_model.eval()
         for p in frozen_model.parameters():
@@ -2267,8 +2921,62 @@ def main():
             f"reference_center={gt_similarity_transform['reference_center']}"
         )
 
+    train_ds_indexed = IndexedDataset(train_ds)
+    valid_ds_indexed = IndexedDataset(valid_ds)
+
+    residual_normalizer = None
+    if args.objective == 'c1_dyn' and args.dyn_whitening:
+        residual_normalizer = precompute_del_residual_normalizer(
+            lagrangian_model=lagrangian_model,
+            dataset=train_ds,
+            device=device,
+            args=args,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            desc='fit DEL residual whitener',
+        )
+        print(
+            "DEL residual norm   : "
+            f"triplets={residual_normalizer['num_triplets']}, "
+            f"ridge={residual_normalizer['ridge']:.2e}, "
+            f"mean={residual_normalizer['mean'].tolist()}"
+        )
+    elif args.objective == 'c1_dyn':
+        print("DEL residual norm   : disabled (using raw residual coordinates)")
+
+    frozen_anchor_cache_registry = {}
+
+    def _cache_key(dataset, seq_len: int):
+        return (str(getattr(dataset, 'mode', 'unknown')), int(seq_len))
+
+    def _ensure_frozen_anchor_cache(cache_key, indexed_dataset: Dataset, desc: str):
+        if frozen_model is None:
+            return None
+        if cache_key not in frozen_anchor_cache_registry:
+            frozen_anchor_cache_registry[cache_key] = precompute_frozen_anchor_cache(
+                frozen_model=frozen_model,
+                indexed_dataset=indexed_dataset,
+                device=device,
+                args=args,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                desc=desc,
+            )
+        return frozen_anchor_cache_registry[cache_key]
+
+    train_frozen_anchor_cache = _ensure_frozen_anchor_cache(
+        _cache_key(train_ds, args.seq_len),
+        train_ds_indexed,
+        desc='cache frozen anchor train',
+    )
+    valid_frozen_anchor_cache = _ensure_frozen_anchor_cache(
+        _cache_key(valid_ds, args.seq_len),
+        valid_ds_indexed,
+        desc='cache frozen anchor valid',
+    )
+
     train_loader = DataLoader(
-        train_ds,
+        train_ds_indexed,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -2276,7 +2984,7 @@ def main():
         pin_memory=True,
     )
     valid_loader = DataLoader(
-        valid_ds,
+        valid_ds_indexed,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -2285,6 +2993,7 @@ def main():
     )
 
     monitor_loaders = {}
+    monitor_anchor_caches = {}
     if args.monitor_visualizations:
         for requested_mode in monitor_modes:
             seq_len_for_mode = monitor_seq_len_for_mode(
@@ -2307,13 +3016,19 @@ def main():
                 )
                 continue
 
+            monitor_ds_indexed = IndexedDataset(monitor_ds)
             monitor_loaders[requested_mode] = DataLoader(
-                monitor_ds,
+                monitor_ds_indexed,
                 batch_size=args.batch_size,
                 shuffle=False,
                 num_workers=args.num_workers,
                 drop_last=False,
                 pin_memory=True,
+            )
+            monitor_anchor_caches[requested_mode] = _ensure_frozen_anchor_cache(
+                _cache_key(monitor_ds, seq_len_for_mode),
+                monitor_ds_indexed,
+                desc=f'cache frozen anchor {requested_mode}',
             )
             if resolved_mode != requested_mode:
                 print(
@@ -2326,9 +3041,13 @@ def main():
             )
 
     route_tag = _default_output_label(args)
-    output_dir = args.output_dir
-    if output_dir is None:
-        output_dir = os.path.join(checkpoint_dir, 'oracle', route_tag)
+    output_root = args.output_dir
+    if output_root is None:
+        output_root = os.path.join(checkpoint_dir, 'oracle', route_tag)
+    run_tag = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    output_dir = os.path.join(output_root, run_tag)
+    args.output_root = output_root
+    args.run_label = route_tag
     args.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
 
@@ -2341,7 +3060,8 @@ def main():
     if args.monitor_visualizations:
         print(
             f"[monitor] Enabled periodic trajectory snapshots: "
-            f"every={args.monitor_every_steps} train steps, "
+            f"every={args.monitor_every_epochs} epoch(s), "
+            f"exact_eval_every={args.exact_eval_monitor_every_epochs} epoch(s), "
             f"k={args.monitor_num_videos}, "
             f"max_batches={args.monitor_max_batches}, "
             f"modes={list(monitor_loaders.keys())}"
@@ -2353,62 +3073,99 @@ def main():
     step_state = {'global_step': 0}
     adaptive_beta_state = {} if args.objective == 'c1_dyn' else None
 
-    def _maybe_write_monitor_snapshot(global_step: int) -> None:
-        if not args.monitor_visualizations:
+    def _write_regular_epoch_monitor(epoch: int) -> None:
+        if not args.monitor_visualizations or len(monitor_loaders) == 0:
             return
-        if len(monitor_loaders) == 0:
-            return
-        if global_step % args.monitor_every_steps != 0:
+        if epoch % args.monitor_every_epochs != 0:
             return
         write_periodic_visualization_snapshot(
             model=model,
             frozen_model=frozen_model,
+            monitor_anchor_caches=monitor_anchor_caches,
             monitor_loaders=monitor_loaders,
             device=device,
             args=args,
             config=config,
             gt_similarity_transform=gt_similarity_transform,
             checkpoint_dir=checkpoint_dir,
-            global_step=global_step,
+            global_step=step_state['global_step'],
+        )
+
+    def _write_exact_epoch_monitor(epoch: int) -> None:
+        if not args.monitor_visualizations or len(monitor_loaders) == 0:
+            return
+        if args.exact_eval_monitor_every_epochs <= 0:
+            return
+        if epoch % args.exact_eval_monitor_every_epochs != 0:
+            return
+        write_exact_eval_monitor_snapshot(
+            model=model,
+            frozen_model=frozen_model,
+            monitor_modes=list(monitor_loaders.keys()),
+            device=device,
+            args=args,
+            config=config,
+            checkpoint_dir=checkpoint_dir,
+            epoch=epoch,
+            global_step=step_state['global_step'],
         )
 
     # Also evaluate at initialization (step 0) before any optimizer update.
-    _maybe_write_monitor_snapshot(step_state['global_step'])
+    if args.monitor_visualizations and len(monitor_loaders) > 0:
+        write_periodic_visualization_snapshot(
+            model=model,
+            frozen_model=frozen_model,
+            monitor_anchor_caches=monitor_anchor_caches,
+            monitor_loaders=monitor_loaders,
+            device=device,
+            args=args,
+            config=config,
+            gt_similarity_transform=gt_similarity_transform,
+            checkpoint_dir=checkpoint_dir,
+            global_step=step_state['global_step'],
+        )
 
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
             model=model,
             frozen_model=frozen_model,
+            frozen_anchor_cache=train_frozen_anchor_cache,
             loader=train_loader,
             device=device,
             args=args,
             config=config,
             gt_similarity_transform=gt_similarity_transform,
             lagrangian_model=lagrangian_model,
+            residual_normalizer=residual_normalizer,
             optimizer=optimizer,
             grad_masks=grad_masks,
             adaptive_beta_state=adaptive_beta_state,
             max_batches=args.max_train_batches,
             desc=f'train e{epoch:03d}',
             step_state=step_state,
-            step_callback=_maybe_write_monitor_snapshot,
+            step_callback=None,
         )
 
         val_metrics = run_epoch(
             model=model,
             frozen_model=frozen_model,
+            frozen_anchor_cache=valid_frozen_anchor_cache,
             loader=valid_loader,
             device=device,
             args=args,
             config=config,
             gt_similarity_transform=gt_similarity_transform,
             lagrangian_model=lagrangian_model,
+            residual_normalizer=residual_normalizer,
             optimizer=None,
             grad_masks=None,
             adaptive_beta_state=adaptive_beta_state,
             max_batches=args.max_valid_batches,
             desc=f'valid e{epoch:03d}',
         )
+
+        _write_regular_epoch_monitor(epoch)
+        _write_exact_epoch_monitor(epoch)
 
         summary = {
             'epoch': epoch,
@@ -2449,13 +3206,25 @@ def main():
         'objective': args.objective,
         'beta': args.beta,
         'beta_role': 'adaptive_c',
+        'beta_floor_rho': args.beta_floor_rho,
+        'beta_floor_warmup_steps': args.beta_floor_warmup_steps,
         'beta_ema_decay': args.beta_ema_decay,
         'beta_eps': args.beta_eps,
+        'dyn_whitening': args.dyn_whitening,
         'adaptive_beta_state': adaptive_beta_state,
         'trainable_attribute_set': args.trainable_attribute_set,
         'gt_normalization': args.gt_normalization,
         'gt_similarity_reference': args.gt_similarity_reference,
         'gt_similarity_transform': gt_similarity_transform,
+        'del_residual_normalizer': (
+            {
+                'mean': residual_normalizer['mean'].tolist(),
+                'cov': residual_normalizer['cov'].tolist(),
+                'ridge': residual_normalizer['ridge'],
+                'num_triplets': residual_normalizer['num_triplets'],
+            }
+            if residual_normalizer is not None else None
+        ),
         'lagrangian_checkpoint': lagrangian_ckpt_path,
         'lagrangian_config_path': args.lagrangian_config_path,
         'lagrangian_config': lagrangian_config,
